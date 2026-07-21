@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  # 编译期内嵌的 zju-connect 版本（darwin-arm64）
+  ZJU_CONNECT_VERSION: v1.2.1
+
+jobs:
+  build:
+    name: build aarch64-apple-darwin
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Rust target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Fetch embedded zju-connect
+        run: |
+          mkdir -p vendor
+          curl -fsSL -o zc.zip \
+            "https://github.com/Mythologyli/zju-connect/releases/download/${ZJU_CONNECT_VERSION}/zju-connect-darwin-arm64.zip"
+          unzip -o zc.zip
+          mv zju-connect vendor/zju-connect
+          chmod +x vendor/zju-connect
+
+      - name: Build release
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          tar -C target/aarch64-apple-darwin/release -czf \
+            easy-proxy-aarch64-apple-darwin.tar.gz easy-proxy
+          shasum -a 256 easy-proxy-aarch64-apple-darwin.tar.gz > easy-proxy-aarch64-apple-darwin.tar.gz.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            easy-proxy-aarch64-apple-darwin.tar.gz
+            easy-proxy-aarch64-apple-darwin.tar.gz.sha256

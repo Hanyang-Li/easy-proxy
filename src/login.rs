@@ -76,7 +76,7 @@ fn pre_sms(base: &str, username: &str, password: &str, jar: &Path) -> Result<Pre
     }
 }
 
-/// sms 回调入参是服务端的短信提示文案（T_SMSINFOR），返回用户输入的验证码。
+/// sms 回调入参是已掩码的手机号（可能为空），返回用户输入的验证码。
 pub fn login(
     server: &str,
     port: u16,
@@ -93,12 +93,17 @@ pub fn login(
 
     // 5. login_sms：触发/确认短信下发
     let sms_resp = curl_post(&base, "/por/login_sms.csp?apiversion=1", &[], jar)?;
-    let infor = find(&sms_resp, r"<T_SMSINFOR>(.*?)</T_SMSINFOR>")
-        .unwrap_or_else(|| "验证码已发送".to_string());
+    // 取手机号（T_SMSINFOR 里通常已掩码，兜底看 USER_PHONE），传给回调用于中文提示
+    let phone = find(&sms_resp, r"<T_SMSINFOR>(.*?)</T_SMSINFOR>")
+        .and_then(|s| extract_phone(&s))
+        .or_else(|| find(&sms_resp, r"<USER_PHONE><!\[CDATA\[(.*?)\]\]></USER_PHONE>"))
+        .or_else(|| find(&sms_resp, r"<USER_PHONE>(.*?)</USER_PHONE>"))
+        .map(|p| mask_phone(&p))
+        .unwrap_or_default();
 
     // 6. login_sms1：交互输入，最多 3 次
     for attempt in 1..=3 {
-        let code = sms(&infor)?;
+        let code = sms(&phone)?;
         let resp = curl_post(
             &base,
             "/por/login_sms1.csp?apiversion=1",
@@ -127,6 +132,24 @@ fn rsa_encrypt(key_hex: &str, exp: u64, plaintext: &str) -> Result<String> {
     Ok(hex::encode(ct))
 }
 
+/// 从文本里抓取手机号片段（连续的数字或含掩码星号，长度≥7）。
+fn extract_phone(s: &str) -> Option<String> {
+    find(s, r"([0-9][0-9*]{6,})")
+}
+
+/// 完整 11 位手机号(1[0-9]{10})掩去中间四位；已含掩码或其他格式原样返回。
+fn mask_phone(s: &str) -> String {
+    let s = s.trim();
+    if s.contains('*') {
+        return s.to_string();
+    }
+    if Regex::new(r"^1[0-9]{10}$").unwrap().is_match(s) {
+        format!("{}****{}", &s[0..3], &s[7..11])
+    } else {
+        s.to_string()
+    }
+}
+
 fn find(haystack: &str, pattern: &str) -> Option<String> {
     Regex::new(pattern)
         .ok()?
@@ -144,6 +167,37 @@ fn twfid_from_jar(jar: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_full_cn_mobile() {
+        assert_eq!(mask_phone("13800138000"), "138****8000");
+        assert_eq!(mask_phone("13912345678"), "139****5678");
+    }
+
+    #[test]
+    fn mask_leaves_already_masked_and_non_phone() {
+        assert_eq!(mask_phone("176****2966"), "176****2966");
+        assert_eq!(mask_phone("12345"), "12345");
+        assert_eq!(mask_phone("not-a-phone"), "not-a-phone");
+    }
+
+    #[test]
+    fn extract_phone_from_server_text() {
+        assert_eq!(
+            extract_phone("The passcode has been sent to 176****2966."),
+            Some("176****2966".to_string())
+        );
+        assert_eq!(
+            extract_phone("已发送至 13912345678"),
+            Some("13912345678".to_string())
+        );
+        assert_eq!(extract_phone("no digits here"), None);
+    }
 }
 
 fn curl_base(jar: &Path) -> Command {

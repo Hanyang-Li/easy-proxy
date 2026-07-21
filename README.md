@@ -8,15 +8,23 @@ CLI 约定参照姊妹项目 `verge-proxy`：eval 式 `start/stop`、powerline �
 
 ## 安装
 
-> **构建前置**：本仓库不含 `zju-connect` 二进制（GPL 开源，见「注意」）。构建前请从
+```sh
+curl -fsSL https://raw.githubusercontent.com/Hanyang-Li/easy-proxy/main/install.sh | sh
+```
+
+脚本从 GitHub Releases 下载 Apple Silicon（M 系列）二进制到 `/usr/local/bin`，并执行 `easy-proxy install`。
+可设置 `VERSION=v0.1.1` 安装指定版本。装完后编辑 `~/.config/easy-proxy/config.yaml` 填入 `server` 与 `username`，再 `source ~/.zshrc`。
+
+### 从源码构建
+
+> 本仓库不含 `zju-connect` 二进制（GPL，见「注意」）。构建前先从
 > [zju-connect releases](https://github.com/Mythologyli/zju-connect/releases) 下载对应平台二进制，
-> 放到 `vendor/zju-connect` 并 `chmod +x`——它会被编译期 `include_bytes!` 内嵌进 easy-proxy。
+> 放到 `vendor/zju-connect` 并 `chmod +x`——编译期 `include_bytes!` 会把它内嵌进 easy-proxy。
 
 ```sh
 cargo build --release
-cp target/release/easy-proxy ~/.local/bin/easy-proxy   # 或 /usr/local/bin（需 sudo）
+sudo cp target/release/easy-proxy /usr/local/bin/easy-proxy
 easy-proxy install
-# 编辑 ~/.config/easy-proxy/config.yaml 填入 server 与 username
 source ~/.zshrc
 ```
 

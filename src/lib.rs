@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use std::io::{IsTerminal, Write};
 
 mod capsule;
 mod config;
@@ -139,14 +140,19 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             }
         };
 
-        let mut sms = |infor: &str| -> Result<String> {
-            eprintln!("  {infor}");
+        let mut sms = |phone: &str| -> Result<String> {
+            let msg = if phone.is_empty() {
+                "短信验证码已发送".to_string()
+            } else {
+                format!("短信验证码已发送至 {phone}")
+            };
+            eprintln!("{}", success_line(&msg, None, &cfg.prompt));
             // 自动化钩子：设置 EASY_PROXY_SMS_FILE 时轮询该文件读取验证码，便于脚本/无 tty 场景
             if let Ok(path) = std::env::var("EASY_PROXY_SMS_FILE") {
                 return wait_sms_file(&path);
             }
             let code: String = dialoguer::Input::new()
-                .with_prompt("请输入短信验证码")
+                .with_prompt("短信验证码")
                 .validate_with(|s: &String| -> Result<(), &str> {
                     if s.trim().chars().all(|c| c.is_ascii_digit()) && (4..=8).contains(&s.trim().len()) {
                         Ok(())
@@ -174,8 +180,20 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     let _ = std::fs::remove_file(&jar);
 
     tunnel::spawn_daemon(paths, cfg, &twfid)?;
-    eprintln!("  正在建立隧道…");
-    let st = tunnel::wait_ready(paths, std::time::Duration::from_secs(45))?;
+    // 中间提示「正在建立隧道…」：在 tty 上用不换行 + 清行，让最终结果替换掉它
+    let tty = std::io::stderr().is_terminal();
+    if tty {
+        eprint!("  正在建立隧道…");
+        let _ = std::io::stderr().flush();
+    } else {
+        eprintln!("  正在建立隧道…");
+    }
+    let ready = tunnel::wait_ready(paths, std::time::Duration::from_secs(45));
+    if tty {
+        eprint!("\r\x1b[2K"); // 回行首并清行
+        let _ = std::io::stderr().flush();
+    }
+    let st = ready?;
     let delay = tunnel::probe_latency(st.port, &st.server);
     let status = ProxyStatus { online: true, delay, port: Some(st.port) };
     println!("{}", success_line("已连接", Some(&status), &cfg.prompt));

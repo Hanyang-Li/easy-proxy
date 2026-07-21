@@ -15,26 +15,26 @@ pub struct PromptConfig {
 impl Default for PromptConfig {
     fn default() -> Self {
         Self {
-            online_icon: Some("\u{f0318}".to_string()),  // 󰌘 link
-            offline_icon: Some("\u{f0319}".to_string()), // 󰌙 link-off
-            delay_icon: Some("\u{f0b6b}".to_string()),   // 󱭫-ish latency
-            port_icon: Some("\u{f0200}".to_string()),    // 󰈀 ethernet
+            online_icon: Some("󰌘".to_string()),   // link
+            offline_icon: Some("󰌙".to_string()),  // link-off
+            delay_icon: Some("󱎫".to_string()),    // 与 verge-proxy 对齐
+            port_icon: Some("󰤨".to_string()),     // 与 verge-proxy 对齐
         }
     }
 }
 
 impl PromptConfig {
     pub fn online(&self) -> &str {
-        self.online_icon.as_deref().unwrap_or("\u{f0318}")
+        self.online_icon.as_deref().unwrap_or("󰌘")
     }
     pub fn offline(&self) -> &str {
-        self.offline_icon.as_deref().unwrap_or("\u{f0319}")
+        self.offline_icon.as_deref().unwrap_or("󰌙")
     }
     pub fn delay(&self) -> &str {
-        self.delay_icon.as_deref().unwrap_or("\u{f0b6b}")
+        self.delay_icon.as_deref().unwrap_or("󱎫")
     }
     pub fn port(&self) -> &str {
-        self.port_icon.as_deref().unwrap_or("\u{f0200}")
+        self.port_icon.as_deref().unwrap_or("󰤨")
     }
 }
 

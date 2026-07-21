@@ -2,7 +2,7 @@
 
 use crate::capsule::success_line;
 use crate::config::{Paths, PromptConfig};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -39,12 +39,12 @@ pub fn cmd_install(paths: &Paths) -> Result<()> {
 
     let cfg_action = ensure_config(paths)?;
     ensure_zju_bin(paths)?;
-    let comp_action = write_completion(paths)?;
+    let (comp_action, comp_path) = write_completion(paths)?;
     let zshrc_action = update_zshrc(paths)?;
 
     let prompt = PromptConfig::default();
     println!("{}", install_line(zshrc_action, "环境配置(.zshrc)", &paths.zshrc, &prompt));
-    println!("{}", install_line(comp_action, "补全配置", &paths.completion_file, &prompt));
+    println!("{}", install_line(comp_action, "补全配置", &comp_path, &prompt));
     println!("{}", install_line(cfg_action, "默认配置", &paths.app_config, &prompt));
     println!(
         "{}",
@@ -97,16 +97,46 @@ mixed_port: 7899
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"
-  delay_icon: "󱦺"
-  port_icon: "󰈀"
+  delay_icon: "󱎫"
+  port_icon: "󰤨"
 "#
     .to_string()
 }
 
-fn write_completion(paths: &Paths) -> Result<Action> {
-    let existed = paths.completion_file.exists();
+fn write_completion(paths: &Paths) -> Result<(Action, PathBuf)> {
+    fs::create_dir_all(&paths.completions_dir)?;
     fs::write(&paths.completion_file, completion_script())?;
-    Ok(if existed { Action::Updated } else { Action::Set })
+    // 软链到 zsh site-functions（与 verge-proxy 一致的位置），让补全真正生效
+    match completion_site_functions_dir() {
+        Ok(dir) => {
+            let target = dir.join("_easy-proxy");
+            let existed = target.exists() || fs::symlink_metadata(&target).is_ok();
+            fs::create_dir_all(&dir)?;
+            if existed {
+                let _ = fs::remove_file(&target);
+            }
+            std::os::unix::fs::symlink(&paths.completion_file, &target)
+                .with_context(|| format!("无法创建补全软链接 {}", target.display()))?;
+            Ok((if existed { Action::Updated } else { Action::Set }, target))
+        }
+        // 没有 brew（或解析失败）时，退回只写源文件并报告源路径
+        Err(_) => Ok((Action::Set, paths.completion_file.clone())),
+    }
+}
+
+fn completion_site_functions_dir() -> Result<PathBuf> {
+    let output = Command::new("brew")
+        .arg("--prefix")
+        .output()
+        .context("无法执行 brew --prefix")?;
+    if !output.status.success() {
+        return Err(anyhow!("brew --prefix 失败"));
+    }
+    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if prefix.is_empty() {
+        return Err(anyhow!("brew --prefix 返回空路径"));
+    }
+    Ok(PathBuf::from(prefix).join("share/zsh/site-functions"))
 }
 
 fn completion_script() -> &'static str {
