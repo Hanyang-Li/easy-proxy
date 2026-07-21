@@ -54,12 +54,13 @@ pub struct AppConfig {
     /// easy-proxy 负责运行它、取回码交服务端校验，取不到/被拒到上限就回退手动输入。
     #[serde(default)]
     pub sms_command: Option<String>,
-    /// 自动取码重试次数（仅当配置了 sms_command 时生效）。默认 1：先自动取一次，
-    /// 若被服务端拒，再重试 1 次（重试前等待 sms_retry_interval_secs，**不重发短信**，
-    /// 只是等正确的码送达后重读），仍失败则回退手动输入。设 0 = 只自动取一次、不重试。
+    /// 自动取码额度（仅当配置了 sms_command 时生效）。总自动取码轮数 = 1 + sms_retries，默认 1 → 共 2 轮。
+    /// 两种「重取」触发：① 被服务端拒 → 等 sms_retry_interval_secs 后重读，**绝不重发短信**；
+    /// ② 脚本没取到码 → **补发一次短信**（整轮登录仅一次）后立即重取（多半是短信还没到）。
+    /// 额度用尽 / 按 esc 取消则回退手动输入。设 0 = 只自动取一次、不重试。
     #[serde(default = "default_sms_retries")]
     pub sms_retries: u32,
-    /// 自动取码「重试前」的等待秒数：给正确的验证码送达 chat.db 的时间（不会重发短信）。默认 30。
+    /// 「被服务端拒后重读」前的等待秒数：给正确的验证码送达 chat.db 的时间（不会重发短信）。默认 30。
     #[serde(default = "default_sms_retry_interval_secs")]
     pub sms_retry_interval_secs: u32,
 }

@@ -115,34 +115,124 @@ fn valid_sms_code(raw: &str) -> Option<String> {
     }
 }
 
+/// 取码结果：取到码 / 没取到（空 · 超时 · 非法输出）/ 用户按 esc 取消。
+#[derive(Debug, PartialEq)]
+enum SmsFetch {
+    Code(String),
+    Empty,
+    Cancelled,
+}
+
+/// 让终端进入「非规范 + 无回显」模式，以便在取码/等待期间非阻塞探测 esc；drop 时恢复原状。
+/// 保留 ISIG，Ctrl-C 依旧能中断。非 tty 时 `new` 返回 None（即无 esc 取消能力）。
+struct EscGuard {
+    orig: libc::termios,
+}
+
+impl EscGuard {
+    fn new() -> Option<EscGuard> {
+        let fd = libc::STDIN_FILENO;
+        if unsafe { libc::isatty(fd) } != 1 {
+            return None;
+        }
+        unsafe {
+            let mut orig: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut orig) != 0 {
+                return None;
+            }
+            let mut raw = orig;
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO); // 关行缓冲与回显，保留 ISIG
+            raw.c_cc[libc::VMIN] = 0; // read 立即返回可用字节数（可能为 0）
+            raw.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+                return None;
+            }
+            Some(EscGuard { orig })
+        }
+    }
+
+    /// 读走当前输入缓冲；出现「单独的 ESC 字节」判为取消（方向键等 ESC 序列忽略）。
+    fn esc_pressed(&self) -> bool {
+        let mut buf = [0u8; 32];
+        let n = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if n <= 0 {
+            return false;
+        }
+        let bytes = &buf[..n as usize];
+        let is_seq = bytes.len() >= 2 && bytes[0] == 0x1b && (bytes[1] == b'[' || bytes[1] == b'O');
+        !is_seq && bytes.contains(&0x1b)
+    }
+}
+
+impl Drop for EscGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
+/// 可被 esc 打断的等待：返回 true 表示中途按了 esc，false 表示睡满 `dur`。
+fn sleep_cancelable(dur: std::time::Duration, esc: Option<&EscGuard>) -> bool {
+    use std::time::Instant;
+    let start = Instant::now();
+    loop {
+        if let Some(e) = esc {
+            if e.esc_pressed() {
+                return true;
+            }
+        }
+        if start.elapsed() >= dur {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+}
+
 /// 执行取码命令（`sh -c <command>`），最多等 `timeout`（防挂死兜底）。
 /// 分工：脚本负责「轮询等码」和「往前看多久 / 是否过期」；easy-proxy 只负责运行它、取回一段输出。
-/// 契约：脚本把 4–8 位验证码打印到 stdout 即视为取到；空输出 / 非数字 / 非零退出 / 超时都视作「没取到」，
-/// 返回 None（调用方回退手动）。码是否被接受，交由后续 login_sms1（服务端）判定。
-fn run_sms_command(command: &str, timeout: std::time::Duration) -> Option<String> {
+/// 契约：脚本把 4–8 位验证码打印到 stdout 即视为取到；空输出 / 非数字 / 非零退出 / 超时都视作「没取到」（Empty）。
+/// 期间若 `esc` 探测到 esc 键，杀掉子进程并返回 `Cancelled`。码是否被接受，交由后续 login_sms1（服务端）判定。
+fn run_sms_command(command: &str, timeout: std::time::Duration, esc: Option<&EscGuard>) -> SmsFetch {
     use std::process::{Command, Stdio};
     use std::time::Instant;
-    let mut child = Command::new("sh")
+    let mut child = match Command::new("sh")
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    {
+        Ok(c) => c,
+        Err(_) => return SmsFetch::Empty,
+    };
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
+                if let Some(e) = esc {
+                    if e.esc_pressed() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return SmsFetch::Cancelled;
+                    }
+                }
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return SmsFetch::Empty;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
-            Err(_) => return None,
+            Err(_) => return SmsFetch::Empty,
         }
     }
     let mut out = String::new();
@@ -150,7 +240,10 @@ fn run_sms_command(command: &str, timeout: std::time::Duration) -> Option<String
         use std::io::Read;
         let _ = so.read_to_string(&mut out);
     }
-    valid_sms_code(&out)
+    match valid_sms_code(&out) {
+        Some(code) => SmsFetch::Code(code),
+        None => SmsFetch::Empty,
+    }
 }
 
 fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
@@ -205,10 +298,14 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             }
         };
 
-        // 本次登录的自动取码进度；被服务端拒后按 sms_retries 重试（重试前等待、不重发短信），
-        // 额度用尽或脚本没取到码则回退手动输入。
+        // 本次登录（每次密码尝试重置）的自动取码状态。两种「重取」触发：
+        //  · 服务端拒码（本闭包被再次调用，auto_done>0）→ 等一会儿让「正确的码」送达后重读，绝不重发短信；
+        //  · 脚本没取到码（空/超时）→ 补发一次短信（整轮登录仅一次）后立即重取，因为多半是短信还没到。
+        // ESC：自动期间按 esc 立即杀掉取码脚本、放弃剩余自动额度、本轮登录余下都转手动。
         let mut auto_done: u32 = 0;
-        let mut sms = |phone: &str| -> Result<String> {
+        let mut resent = false; // 是否已补发过短信（硬限一次，别循环发 SMS）
+        let mut auto_off = false; // ESC 取消后，本轮登录余下都走手动
+        let mut sms = |phone: &str, resend: &mut dyn FnMut() -> Result<()>| -> Result<String> {
             let msg = if phone.is_empty() {
                 "短信验证码已发送".to_string()
             } else {
@@ -219,51 +316,97 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             if let Ok(path) = std::env::var("EASY_PROXY_SMS_FILE") {
                 return wait_sms_file(&path);
             }
-            // 可插拔自动取码：config.sms_command 配了就执行一次；脚本自行轮询/判断有效期，
-            // 取到即用，取不到（空/超时）回退手动输入。
+            // 可插拔自动取码：config.sms_command 配了才启用。脚本自行轮询/判断有效期，
+            // 取到即用；没取到就补发一次再取；被拒则等待后重读；ESC / 额度用尽回退手动。
             if let Some(cmd) = cfg
                 .sms_command
                 .as_deref()
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
             {
-                if auto_done < auto_max {
-                    if auto_done > 0 {
-                        // 重试：上一个自动取的码被服务端拒。等一会儿让「正确的验证码」送达 chat.db
-                        // 后再重读——绝不重发短信（重发只会重蹈覆辙）。
+                if auto_off {
+                    // 之前已按 esc 取消（取消时已提示），静默走手动
+                } else if auto_done >= auto_max {
+                    eprintln!(
+                        "{}",
+                        error_line("[自动] 自动取码已达上限，回退手动输入", None, &cfg.prompt)
+                    );
+                } else {
+                    let esc = EscGuard::new(); // None = 非 tty，无 esc 取消能力
+                    let tty = std::io::stderr().is_terminal();
+
+                    // 拒码重试：闭包被再次调用（auto_done>0）说明上一个自动码被服务端拒。
+                    // 等一会儿让「正确的码」送达 chat.db、盖过旧码后再重读——绝不重发短信。
+                    let mut cancelled = if auto_done > 0 {
                         eprintln!(
                             "  [自动] 上一个验证码被拒，等待 {}s 后重读（不重发短信）…",
                             cfg.sms_retry_interval_secs
                         );
-                        std::thread::sleep(retry_wait);
-                    }
-                    auto_done += 1;
-                    // 「取码中…」作为进度行：tty 上不换行，拿到结果后清行替换（同「建立隧道→已连接」）
-                    let tty = std::io::stderr().is_terminal();
-                    let progress = format!("  [自动] 第 {auto_done}/{auto_max} 次取码（脚本自行轮询）…");
-                    if tty {
-                        eprint!("{progress}");
-                        let _ = std::io::stderr().flush();
+                        sleep_cancelable(retry_wait, esc.as_ref())
                     } else {
-                        eprintln!("{progress}");
+                        false
+                    };
+
+                    while !cancelled && auto_done < auto_max {
+                        auto_done += 1;
+                        // 「取码中…」作为进度行：tty 上不换行，拿到结果后清行替换（同「建立隧道→已连接」）
+                        let hint = if esc.is_some() { " (esc 键取消)" } else { "" };
+                        let progress = format!("  [自动] 第 {auto_done}/{auto_max} 次取码…{hint}");
+                        if tty {
+                            eprint!("{progress}");
+                            let _ = std::io::stderr().flush();
+                        } else {
+                            eprintln!("{progress}");
+                        }
+                        let outcome = run_sms_command(cmd, SMS_COMMAND_TIMEOUT, esc.as_ref());
+                        if tty {
+                            eprint!("\r\x1b[2K"); // 回行首并清行，让结果替换掉进度行
+                            let _ = std::io::stderr().flush();
+                        }
+                        match outcome {
+                            SmsFetch::Code(code) => {
+                                eprintln!("{}", success_line("[自动] 已获取验证码", None, &cfg.prompt));
+                                return Ok(code); // EscGuard 在返回时 drop，恢复终端
+                            }
+                            SmsFetch::Cancelled => cancelled = true,
+                            SmsFetch::Empty => {
+                                // 没取到码：短信多半还没到 → 补发一次再取（仅一次，且需还有额度）
+                                if !resent && auto_done < auto_max {
+                                    resent = true;
+                                    eprintln!("  [自动] 未取到验证码，补发短信后重取（仅一次）…");
+                                    if let Err(e) = resend() {
+                                        eprintln!(
+                                            "{}",
+                                            error_line(
+                                                &format!("[自动] 补发短信失败：{e}"),
+                                                None,
+                                                &cfg.prompt
+                                            )
+                                        );
+                                        break; // 转手动
+                                    }
+                                    // 立即重取：取码脚本自行轮询、等新短信落库
+                                } else {
+                                    break; // 没额度 / 已补发过 → 转手动
+                                }
+                            }
+                        }
                     }
-                    let got = run_sms_command(cmd, SMS_COMMAND_TIMEOUT);
-                    if tty {
-                        eprint!("\r\x1b[2K"); // 回行首并清行，让结果替换掉进度行
-                        let _ = std::io::stderr().flush();
+
+                    if cancelled {
+                        auto_off = true;
+                        eprintln!(
+                            "{}",
+                            error_line("[自动] 已取消自动取码，转手动输入", None, &cfg.prompt)
+                        );
+                    } else {
+                        eprintln!(
+                            "{}",
+                            error_line("[自动] 未取到验证码，回退手动输入", None, &cfg.prompt)
+                        );
                     }
-                    if let Some(code) = got {
-                        eprintln!("{}", success_line("[自动] 已获取验证码", None, &cfg.prompt));
-                        return Ok(code);
-                    }
-                    // 脚本没取到码（空/超时）：再等也多半没有 → 放弃剩余自动额度，回退手动
-                    auto_done = auto_max;
-                    eprintln!(
-                        "{}",
-                        error_line("[自动] 未取到验证码，回退手动输入", None, &cfg.prompt)
-                    );
+                    // EscGuard 在此 drop，终端恢复规范模式，交给下面的 dialoguer
                 }
-                // 自动额度用尽 → 落到下面手动输入
             }
             let code: String = dialoguer::Input::new()
                 .with_prompt("短信验证码")
@@ -438,23 +581,26 @@ mod tests {
     #[test]
     fn command_stdout_code_is_returned() {
         assert_eq!(
-            run_sms_command("echo 654321", Duration::from_secs(5)),
-            Some("654321".to_string())
+            run_sms_command("echo 654321", Duration::from_secs(5), None),
+            SmsFetch::Code("654321".to_string())
         );
     }
 
     #[test]
-    fn command_no_valid_output_is_none() {
-        assert_eq!(run_sms_command("true", Duration::from_secs(5)), None);
-        assert_eq!(run_sms_command("exit 1", Duration::from_secs(5)), None);
-        assert_eq!(run_sms_command("echo not-a-code", Duration::from_secs(5)), None);
+    fn command_no_valid_output_is_empty() {
+        assert_eq!(run_sms_command("true", Duration::from_secs(5), None), SmsFetch::Empty);
+        assert_eq!(run_sms_command("exit 1", Duration::from_secs(5), None), SmsFetch::Empty);
+        assert_eq!(
+            run_sms_command("echo not-a-code", Duration::from_secs(5), None),
+            SmsFetch::Empty
+        );
     }
 
     #[test]
-    fn command_timeout_kills_and_returns_none() {
+    fn command_timeout_kills_and_returns_empty() {
         let start = Instant::now();
-        let code = run_sms_command("sleep 5; echo 123456", Duration::from_millis(300));
-        assert_eq!(code, None);
+        let code = run_sms_command("sleep 5; echo 123456", Duration::from_millis(300), None);
+        assert_eq!(code, SmsFetch::Empty);
         assert!(start.elapsed() < Duration::from_secs(3), "应在超时后立即返回，不等满 5s");
     }
 }

@@ -76,6 +76,10 @@ fn pre_sms(base: &str, username: &str, password: &str, jar: &Path) -> Result<Pre
     }
 }
 
+/// 取码回调：入参是已掩码的手机号（可能为空）和「补发一次短信」的钩子，返回要提交的验证码。
+/// 回调可在「脚本没取到码」时调用该钩子重发短信；被服务端拒时则不该调用它。
+pub type SmsCallback<'a> = dyn FnMut(&str, &mut dyn FnMut() -> Result<()>) -> Result<String> + 'a;
+
 /// sms 回调入参是已掩码的手机号（可能为空），返回用户输入的验证码。
 pub fn login(
     server: &str,
@@ -84,7 +88,7 @@ pub fn login(
     password: &str,
     jar: &Path,
     max_attempts: u32,
-    sms: &mut dyn FnMut(&str) -> Result<String>,
+    sms: &mut SmsCallback<'_>,
 ) -> Result<LoginOutcome> {
     let base = format!("https://{server}:{port}");
     match pre_sms(&base, username, password, jar)? {
@@ -103,10 +107,14 @@ pub fn login(
         .unwrap_or_default();
 
     // 6. login_sms1：提交验证码，最多 max_attempts 次（自动取码额度 + 手动兜底）。
-    //    注意：这里只是重复提交，绝不重发短信——短信已在 login_psw 那一刻发出。
+    //    本步只重复提交、不重发短信；仅当回调「没取到码」时经 resend 补发一次（再打一次 login_sms.csp）。
     let max_attempts = max_attempts.max(1);
+    // 供回调在「脚本没取到码」时补发一次短信：重新触发 login_sms.csp 下发。
+    let mut resend = || -> Result<()> {
+        curl_post(&base, "/por/login_sms.csp?apiversion=1", &[], jar).map(|_| ())
+    };
     for attempt in 1..=max_attempts {
-        let code = sms(&phone)?;
+        let code = sms(&phone, &mut resend)?;
         let resp = curl_post(
             &base,
             "/por/login_sms1.csp?apiversion=1",
