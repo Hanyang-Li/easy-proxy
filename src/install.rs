@@ -94,6 +94,12 @@ port: 443
 username: ""          # 门户登录用户名/邮箱，例: your-name@example.com
 # 本机对外暴露的混合代理端口（http+socks 同一个端口）
 mixed_port: 7899
+# 自动获取短信验证码（可选、可插拔，默认关闭）：配一条命令，connect 时执行它取码，
+# 取不到就回退手动输入。命令经 `sh -c` 执行；脚本自己负责轮询等码、往前看多久、是否过期，
+# 只需把 4–8 位数字打到 stdout（是否有效由服务端最终校验）。示例脚本见 README（不随程序内置）。
+# sms_command: "python3 ~/.config/easy-proxy/get_sms.py"
+# sms_retries: 1              # 自动码被拒后重读几次（不重发短信）。默认 1，用尽回退手动
+# sms_retry_interval_secs: 30 # 每次重试前等待秒数（给正确验证码送达的时间）。默认 30
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"

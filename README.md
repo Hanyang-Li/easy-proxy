@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/Hanyang-Li/easy-proxy/main/install.
 ```
 
 脚本从 GitHub Releases 下载 Apple Silicon（M 系列）二进制到 `/usr/local/bin`，并执行 `easy-proxy install`。
-可设置 `VERSION=v0.1.1` 安装指定版本。装完后编辑 `~/.config/easy-proxy/config.yaml` 填入 `server` 与 `username`，再 `source ~/.zshrc`。
+可设置 `VERSION=v0.2.0` 安装指定版本。装完后编辑 `~/.config/easy-proxy/config.yaml` 填入 `server` 与 `username`，再 `source ~/.zshrc`。
 
 ### 从源码构建
 
@@ -70,6 +70,7 @@ server: "vpn.example.com"       # 你的深信服 EasyConnect 门户地址
 port: 443
 username: "your-name@example.com"
 mixed_port: 7899          # 本机对外暴露的混合端口（避开 clash verge 的 7897 等）
+# sms_command: "python3 ~/.config/easy-proxy/get_sms.py"   # 可选：自动取码命令（见「自动获取短信验证码」）
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"
@@ -99,6 +100,88 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 
 - `EASY_PROXY_PASSWORD`：非交互提供密码（跳过钥匙串/提示）。
 - `EASY_PROXY_SMS_FILE`：`connect` 会轮询该文件读取短信验证码（写入 4–8 位数字即可），便于脚本驱动。
+
+## 自动获取短信验证码（可选、可插拔）
+
+`connect` 默认需要手动输入短信验证码。如果你的短信能被某处程序读到（例如 macOS 开了 iPhone
+「短信转发」，验证码会进「信息」App 的 `~/Library/Messages/chat.db`），可以在 config 里配一条
+**取码命令**让它自动完成：
+
+```yaml
+sms_command: "python3 ~/.config/easy-proxy/get_sms.py"
+sms_retries: 1               # 自动码被拒后重读几次（不重发短信），默认 1
+sms_retry_interval_secs: 30  # 每次重试前等待秒数，默认 30
+```
+
+- 配了就用：`connect` 发出验证码后执行该命令；脚本取到就自动填入，取不到则**回退手动输入**，不会卡死。
+- 优先级：`EASY_PROXY_SMS_FILE`（若设置）> `sms_command` > 手动输入。
+- easy-proxy 本身**不含任何读码逻辑、也不内置脚本**——取码逻辑完全由你的命令决定，仓库不收录该脚本。
+- **重试不重发**：自动码被服务端拒时按 `sms_retries`（默认 1）重试；每次重试前先等 `sms_retry_interval_secs`（默认 30s）让**正确的**码送达后再重读，**绝不重发新短信**（第一次常读到还没到货的旧码，等一下重读就对了；重发反而重蹈覆辙）。重试用尽仍失败才回退手动。总的 `login_sms1` 提交次数 = (1 + `sms_retries`) 次自动 + 3 次手动兜底。
+
+**分工**（谁负责什么）：
+
+| 负责方 | 职责 |
+|---|---|
+| **你的脚本** | 轮询等码、决定「往前看多久」、本地是否过期。取到就把 4–8 位码打到 stdout（`exit 0`）；暂时没有就 `exit 1` 或空输出。轮询与超时都在脚本里（示例约 60s）。 |
+| **easy-proxy** | 只 `sh -c` 跑一次命令、取回一段输出（safety cap 90s，防脚本挂死）。拿到码交 `login_sms1` 让**服务端**判真假；被拒时本次登录**自动只试一次、之后转手动**；没取到（空/非零/超时）直接回退手动输入。 |
+
+> **为什么判据是「有效期」而不是「本次登录后才收到」**：深信服门户在约 5 分钟内不会重发短信，而是要你复用上一条码。所以脚本该找「仍在有效期内的最新一条码」（无论是刚发的还是被复用的旧的），而不是死等一条新短信。
+
+**示例：从 macOS「信息」`chat.db` 轮询读取**（自行放到 `~/.config/easy-proxy/get_sms.py`，按你的短信文案调整关键词/正则）。用 `LOOKBACK_SECS` 往前看、再用短信自带的「有效期截止 HH:MM」精确校验未过期：
+
+```python
+#!/usr/bin/env python3
+import os, re, sqlite3, sys, time
+from datetime import datetime, timedelta
+
+LOOKBACK_SECS, POLL_TIMEOUT, POLL_INTERVAL = 300, 60, 2   # 往前看 / 轮询上限 / 间隔
+DB = os.path.expanduser("~/Library/Messages/chat.db")
+
+def find_valid_code():
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    # chat.db 的 date 是「2001-01-01 起的纳秒」，+978307200 换成 Unix 秒
+    rows = con.execute("""
+        SELECT text, date/1000000000 + 978307200 AS ts
+        FROM message WHERE text LIKE '%VPN登录验证码%'
+        ORDER BY date DESC LIMIT 8
+    """).fetchall()
+    con.close()
+    now, floor = datetime.now(), time.time() - LOOKBACK_SECS
+    for text, ts in rows:
+        text = text or ""
+        if ts is None or ts < floor:            # 超出「往前看」窗口
+            continue
+        m = re.search(r'验证码[:：]?\s*(\d{4,8})', text)
+        if not m:
+            continue
+        exp = re.search(r'截止\s*(\d{1,2}):(\d{2})', text)   # 精确校验未过期（含跨零点）
+        if exp:
+            recv = datetime.fromtimestamp(ts)
+            deadline = recv.replace(hour=int(exp.group(1)), minute=int(exp.group(2)),
+                                    second=0, microsecond=0)
+            if deadline < recv:
+                deadline += timedelta(days=1)
+            if now >= deadline - timedelta(seconds=5):
+                continue
+        return m.group(1)
+    return None
+
+end = time.time() + POLL_TIMEOUT
+while True:
+    code = find_valid_code()
+    if code:
+        print(code); sys.exit(0)
+    if time.time() >= end:
+        sys.exit(1)                             # 放弃 → easy-proxy 回退手动输入
+    time.sleep(POLL_INTERVAL)
+```
+
+> 前提：终端（或 easy-proxy 所在进程）对 `~/Library/Messages/chat.db` 有读权限（macOS「完全磁盘访问权限」），
+> 且 iPhone 已开启「设置 → 信息 → 短信转发」把这台 Mac 勾上。转发经 Apple 服务器中转，不要求同一 Wi-Fi/近距离；
+> 但手机关机 / 无网络、或转发被关时会取不到——此时自动回退手动输入。
 
 ## 注意
 

@@ -101,6 +101,58 @@ fn wait_sms_file(path: &str) -> Result<String> {
     }
 }
 
+/// 取码命令的安全上限：轮询与「往前看多久」的逻辑都在脚本里（示例脚本自行轮询约 60s），
+/// 这里只作防挂死兜底——超过它仍没返回就杀掉子进程、回退手动输入。
+const SMS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// 校验取码输出：去掉首尾空白后，必须是 4–8 位纯数字，否则视作「还没取到」。
+fn valid_sms_code(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && (4..=8).contains(&s.len()) {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// 执行取码命令（`sh -c <command>`），最多等 `timeout`（防挂死兜底）。
+/// 分工：脚本负责「轮询等码」和「往前看多久 / 是否过期」；easy-proxy 只负责运行它、取回一段输出。
+/// 契约：脚本把 4–8 位验证码打印到 stdout 即视为取到；空输出 / 非数字 / 非零退出 / 超时都视作「没取到」，
+/// 返回 None（调用方回退手动）。码是否被接受，交由后续 login_sms1（服务端）判定。
+fn run_sms_command(command: &str, timeout: std::time::Duration) -> Option<String> {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        use std::io::Read;
+        let _ = so.read_to_string(&mut out);
+    }
+    valid_sms_code(&out)
+}
+
 fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     if cfg.server.trim().is_empty() || cfg.username.trim().is_empty() {
         return Err(anyhow!(
@@ -129,6 +181,18 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             .or_else(|| keychain::get_password(&cfg.username))
     };
 
+    // 自动取码额度与重试节奏（仅在配置了 sms_command 时启用自动）：
+    // 总自动提交次数 = 1（首次）+ sms_retries（重试）；login_sms1 总次数再加 3 次手动兜底。
+    let auto_enabled = cfg
+        .sms_command
+        .as_deref()
+        .map(str::trim)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let auto_max: u32 = if auto_enabled { 1 + cfg.sms_retries } else { 0 };
+    let retry_wait = std::time::Duration::from_secs(cfg.sms_retry_interval_secs as u64);
+    let max_attempts = auto_max + 3;
+
     let twfid = loop {
         let (pwd, from_user) = match password.take() {
             Some(p) => (p, false),
@@ -140,6 +204,9 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             }
         };
 
+        // 本次登录的自动取码进度；被服务端拒后按 sms_retries 重试（重试前等待、不重发短信），
+        // 额度用尽或脚本没取到码则回退手动输入。
+        let mut auto_done: u32 = 0;
         let mut sms = |phone: &str| -> Result<String> {
             let msg = if phone.is_empty() {
                 "短信验证码已发送".to_string()
@@ -150,6 +217,52 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             // 自动化钩子：设置 EASY_PROXY_SMS_FILE 时轮询该文件读取验证码，便于脚本/无 tty 场景
             if let Ok(path) = std::env::var("EASY_PROXY_SMS_FILE") {
                 return wait_sms_file(&path);
+            }
+            // 可插拔自动取码：config.sms_command 配了就执行一次；脚本自行轮询/判断有效期，
+            // 取到即用，取不到（空/超时）回退手动输入。
+            if let Some(cmd) = cfg
+                .sms_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                if auto_done < auto_max {
+                    if auto_done > 0 {
+                        // 重试：上一个自动取的码被服务端拒。等一会儿让「正确的验证码」送达 chat.db
+                        // 后再重读——绝不重发短信（重发只会重蹈覆辙）。
+                        eprintln!(
+                            "  [自动] 上一个验证码被拒，等待 {}s 后重读（不重发短信）…",
+                            cfg.sms_retry_interval_secs
+                        );
+                        std::thread::sleep(retry_wait);
+                    }
+                    auto_done += 1;
+                    // 「取码中…」作为进度行：tty 上不换行，拿到结果后清行替换（同「建立隧道→已连接」）
+                    let tty = std::io::stderr().is_terminal();
+                    let progress = format!("  [自动] 第 {auto_done}/{auto_max} 次取码（脚本自行轮询）…");
+                    if tty {
+                        eprint!("{progress}");
+                        let _ = std::io::stderr().flush();
+                    } else {
+                        eprintln!("{progress}");
+                    }
+                    let got = run_sms_command(cmd, SMS_COMMAND_TIMEOUT);
+                    if tty {
+                        eprint!("\r\x1b[2K"); // 回行首并清行，让结果替换掉进度行
+                        let _ = std::io::stderr().flush();
+                    }
+                    if let Some(code) = got {
+                        eprintln!("{}", success_line("[自动] 已获取验证码", None, &cfg.prompt));
+                        return Ok(code);
+                    }
+                    // 脚本没取到码（空/超时）：再等也多半没有 → 放弃剩余自动额度，回退手动
+                    auto_done = auto_max;
+                    eprintln!(
+                        "{}",
+                        error_line("[自动] 未取到验证码，回退手动输入", None, &cfg.prompt)
+                    );
+                }
+                // 自动额度用尽 → 落到下面手动输入
             }
             let code: String = dialoguer::Input::new()
                 .with_prompt("短信验证码")
@@ -164,7 +277,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             Ok(code.trim().to_string())
         };
 
-        match login::login(&cfg.server, cfg.port, &cfg.username, &pwd, &jar, &mut sms)? {
+        match login::login(&cfg.server, cfg.port, &cfg.username, &pwd, &jar, max_attempts, &mut sms)? {
             login::LoginOutcome::Ok(twfid) => {
                 if from_user {
                     keychain::set_password(&cfg.username, &pwd)?;
@@ -296,5 +409,51 @@ fn cmd_port(paths: &Paths, cfg: &AppConfig, connected_only: bool) -> Result<()> 
             println!("{}", cfg.mixed_port);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn valid_code_accepts_4_to_8_digits() {
+        assert_eq!(valid_sms_code(" 929869 \n"), Some("929869".to_string()));
+        assert_eq!(valid_sms_code("1234"), Some("1234".to_string()));
+        assert_eq!(valid_sms_code("12345678"), Some("12345678".to_string()));
+    }
+
+    #[test]
+    fn valid_code_rejects_junk() {
+        assert_eq!(valid_sms_code(""), None);
+        assert_eq!(valid_sms_code("   "), None);
+        assert_eq!(valid_sms_code("123"), None); // 太短
+        assert_eq!(valid_sms_code("123456789"), None); // 太长
+        assert_eq!(valid_sms_code("code:123456"), None); // 非纯数字
+        assert_eq!(valid_sms_code("abcd"), None);
+    }
+
+    #[test]
+    fn command_stdout_code_is_returned() {
+        assert_eq!(
+            run_sms_command("echo 654321", Duration::from_secs(5)),
+            Some("654321".to_string())
+        );
+    }
+
+    #[test]
+    fn command_no_valid_output_is_none() {
+        assert_eq!(run_sms_command("true", Duration::from_secs(5)), None);
+        assert_eq!(run_sms_command("exit 1", Duration::from_secs(5)), None);
+        assert_eq!(run_sms_command("echo not-a-code", Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn command_timeout_kills_and_returns_none() {
+        let start = Instant::now();
+        let code = run_sms_command("sleep 5; echo 123456", Duration::from_millis(300));
+        assert_eq!(code, None);
+        assert!(start.elapsed() < Duration::from_secs(3), "应在超时后立即返回，不等满 5s");
     }
 }

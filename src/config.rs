@@ -49,6 +49,19 @@ pub struct AppConfig {
     pub mixed_port: u16,
     #[serde(default)]
     pub prompt: PromptConfig,
+    /// 可选、可插拔的自动取码命令（`sh -c` 执行）。为空/缺省则 connect 时手动输入验证码。
+    /// 分工：脚本负责轮询等码、往前看多久、本地是否过期，并把 4–8 位码打到 stdout；
+    /// easy-proxy 负责运行它、取回码交服务端校验，取不到/被拒到上限就回退手动输入。
+    #[serde(default)]
+    pub sms_command: Option<String>,
+    /// 自动取码重试次数（仅当配置了 sms_command 时生效）。默认 1：先自动取一次，
+    /// 若被服务端拒，再重试 1 次（重试前等待 sms_retry_interval_secs，**不重发短信**，
+    /// 只是等正确的码送达后重读），仍失败则回退手动输入。设 0 = 只自动取一次、不重试。
+    #[serde(default = "default_sms_retries")]
+    pub sms_retries: u32,
+    /// 自动取码「重试前」的等待秒数：给正确的验证码送达 chat.db 的时间（不会重发短信）。默认 30。
+    #[serde(default = "default_sms_retry_interval_secs")]
+    pub sms_retry_interval_secs: u32,
 }
 
 fn default_https_port() -> u16 {
@@ -56,6 +69,12 @@ fn default_https_port() -> u16 {
 }
 fn default_mixed_port() -> u16 {
     7899
+}
+fn default_sms_retries() -> u32 {
+    1
+}
+fn default_sms_retry_interval_secs() -> u32 {
+    30
 }
 
 impl Default for AppConfig {
@@ -66,6 +85,9 @@ impl Default for AppConfig {
             username: String::new(),
             mixed_port: 7899,
             prompt: PromptConfig::default(),
+            sms_command: None,
+            sms_retries: 1,
+            sms_retry_interval_secs: 30,
         }
     }
 }

@@ -83,6 +83,7 @@ pub fn login(
     username: &str,
     password: &str,
     jar: &Path,
+    max_attempts: u32,
     sms: &mut dyn FnMut(&str) -> Result<String>,
 ) -> Result<LoginOutcome> {
     let base = format!("https://{server}:{port}");
@@ -101,8 +102,10 @@ pub fn login(
         .map(|p| mask_phone(&p))
         .unwrap_or_default();
 
-    // 6. login_sms1：交互输入，最多 3 次
-    for attempt in 1..=3 {
+    // 6. login_sms1：提交验证码，最多 max_attempts 次（自动取码额度 + 手动兜底）。
+    //    注意：这里只是重复提交，绝不重发短信——短信已在 login_psw 那一刻发出。
+    let max_attempts = max_attempts.max(1);
+    for attempt in 1..=max_attempts {
         let code = sms(&phone)?;
         let resp = curl_post(
             &base,
@@ -118,9 +121,9 @@ pub fn login(
         }
         let why = find(&resp, r"<Message><!\[CDATA\[(.*?)\]\]></Message>")
             .unwrap_or_else(|| "验证码校验失败".to_string());
-        eprintln!("  验证码错误（{why}），剩余 {} 次", 3 - attempt);
+        eprintln!("  验证码错误（{why}），剩余 {} 次", max_attempts - attempt);
     }
-    Err(anyhow!("验证码连续 3 次错误"))
+    Err(anyhow!("验证码连续 {max_attempts} 次错误"))
 }
 
 fn rsa_encrypt(key_hex: &str, exp: u64, plaintext: &str) -> Result<String> {

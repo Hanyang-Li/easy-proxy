@@ -26,7 +26,7 @@ else
   tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
     sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
 fi
-[ -n "$tag" ] || fail "无法获取最新版本号，可设置 VERSION=v0.1.1 后重试"
+[ -n "$tag" ] || fail "无法获取最新版本号，可设置 VERSION=v0.2.0 后重试"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
