@@ -17,7 +17,7 @@ pub fn pid_alive(pid: i32) -> bool {
 
 /// 以会话首进程（setsid）方式启动脱离终端的守护进程。
 pub fn spawn_daemon(paths: &Paths, cfg: &AppConfig, twfid: &str) -> Result<()> {
-    fs::create_dir_all(&paths.config_dir)?;
+    fs::create_dir_all(&paths.runtime_dir)?; // 日志/状态都写在这里
     paths.clear_state();
     let exe = std::env::current_exe().context("无法定位自身可执行文件")?;
     let log = File::create(&paths.daemon_log)

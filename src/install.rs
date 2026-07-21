@@ -36,6 +36,8 @@ pub fn cmd_install(paths: &Paths) -> Result<()> {
     fs::create_dir_all(&paths.config_dir)
         .with_context(|| format!("无法创建 {}", paths.config_dir.display()))?;
     fs::create_dir_all(&paths.completions_dir)?;
+    fs::create_dir_all(&paths.runtime_dir)?;
+    migrate_old_layout(paths);
 
     let cfg_action = ensure_config(paths)?;
     ensure_zju_bin(paths)?;
@@ -57,9 +59,25 @@ pub fn cmd_install(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// 释放内嵌 zju-connect 到配置目录（缺失或大小不符才重写），赋可执行权限并去除隔离属性。
+/// 0.2.1 起把「全塞在 ~/.config/easy-proxy」的旧布局迁移过来：运行时文件挪去 ~/.easy-proxy，
+/// 顶层 zju-connect 旧副本清掉（由 bin/zju-connect 取代）。best-effort，出错不影响安装。
+fn migrate_old_layout(paths: &Paths) {
+    let old = |name: &str| paths.config_dir.join(name);
+    // 状态文件：能移就移（尽量保住「已连接」视图），移不动就算了
+    let old_state = old("state.json");
+    if old_state.exists() && !paths.state.exists() {
+        let _ = fs::create_dir_all(&paths.runtime_dir);
+        let _ = fs::rename(&old_state, &paths.state);
+    }
+    // 旧位置遗留：日志会重建、cookie 是临时、顶层 zju-connect 由 bin/ 取代 → 直接清掉
+    for name in ["zju-connect", "daemon.log", "tunnel.log", ".cookies", "state.json"] {
+        let _ = fs::remove_file(old(name));
+    }
+}
+
+/// 释放内嵌 zju-connect 到 ~/.config/easy-proxy/bin/zju-connect（缺失或大小不符才重写），赋可执行权限并去隔离属性。
 pub fn ensure_zju_bin(paths: &Paths) -> Result<()> {
-    fs::create_dir_all(&paths.config_dir)?;
+    fs::create_dir_all(&paths.bin_dir)?;
     let need = match fs::metadata(&paths.zju_bin) {
         Ok(m) => m.len() != ZJU_BIN.len() as u64,
         Err(_) => true,
@@ -97,7 +115,7 @@ mixed_port: 7899
 # 自动获取短信验证码（可选、可插拔，默认关闭）：配一条命令，connect 时执行它取码，
 # 取不到就回退手动输入。命令经 `sh -c` 执行；脚本自己负责轮询等码、往前看多久、是否过期，
 # 只需把 4–8 位数字打到 stdout（是否有效由服务端最终校验）。示例脚本见 README（不随程序内置）。
-# sms_command: "python3 ~/.config/easy-proxy/get_sms.py"
+# sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"
 # sms_retries: 1              # 自动码被拒后重读几次（不重发短信）。默认 1，用尽回退手动
 # sms_retry_interval_secs: 30 # 每次重试前等待秒数（给正确验证码送达的时间）。默认 30
 prompt:

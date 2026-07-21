@@ -171,8 +171,9 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     }
 
     install::ensure_zju_bin(paths)?;
+    std::fs::create_dir_all(&paths.runtime_dir)?; // 登录 cookie / 状态 / 日志的落脚处
 
-    let jar = paths.config_dir.join(".cookies");
+    let jar = paths.cookies.clone();
     let mut password = if relogin {
         None
     } else {

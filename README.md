@@ -30,11 +30,30 @@ source ~/.zshrc
 
 `install` 会：
 - 写默认配置 `~/.config/easy-proxy/config.yaml`
-- 释放内嵌的 `zju-connect` 到 `~/.config/easy-proxy/zju-connect`
+- 释放内嵌的 `zju-connect` 到 `~/.config/easy-proxy/bin/zju-connect`
 - 生成 zsh 补全 `~/.config/easy-proxy/completions/_easy-proxy`
 - 在 `~/.zshrc` 的托管块（`# >>> easy-proxy >>>` … `# <<< easy-proxy <<<`）里写入 `easy-proxy()` wrapper 与 `ep()` 函数
 
 二进制**自包含**（`zju-connect` 编译期内嵌），拷走单个文件即可用。
+
+## 目录结构
+
+配置/资源与运行时产物分开放：
+
+```
+~/.config/easy-proxy/          # 静态配置与资源
+├── config.yaml                #   配置
+├── completions/_easy-proxy    #   zsh 补全
+├── bin/zju-connect            #   释放出的隧道后端
+└── scripts/get_sms.py         #   （可选）你自备的自动取码脚本
+
+~/.easy-proxy/                 # 运行时产物（不与配置混放）
+├── state.json                 #   连接状态（status/port 读它）
+├── daemon.log / tunnel.log    #   守护进程 / zju-connect 日志
+└── .cookies                   #   登录时的临时 cookie
+```
+
+（从 0.2.0 及更早版本升级时，`install` 会自动把旧的运行时文件挪出配置目录、清掉顶层旧 `zju-connect`。）
 
 ## 命令
 
@@ -70,7 +89,7 @@ server: "vpn.example.com"       # 你的深信服 EasyConnect 门户地址
 port: 443
 username: "your-name@example.com"
 mixed_port: 7899          # 本机对外暴露的混合端口（避开 clash verge 的 7897 等）
-# sms_command: "python3 ~/.config/easy-proxy/get_sms.py"   # 可选：自动取码命令（见「自动获取短信验证码」）
+# sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"   # 可选：自动取码命令（见「自动获取短信验证码」）
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"
@@ -108,7 +127,7 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 **取码命令**让它自动完成：
 
 ```yaml
-sms_command: "python3 ~/.config/easy-proxy/get_sms.py"
+sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"
 sms_retries: 1               # 自动码被拒后重读几次（不重发短信），默认 1
 sms_retry_interval_secs: 30  # 每次重试前等待秒数，默认 30
 ```
@@ -127,7 +146,7 @@ sms_retry_interval_secs: 30  # 每次重试前等待秒数，默认 30
 
 > **为什么判据是「有效期」而不是「本次登录后才收到」**：深信服门户在约 5 分钟内不会重发短信，而是要你复用上一条码。所以脚本该找「仍在有效期内的最新一条码」（无论是刚发的还是被复用的旧的），而不是死等一条新短信。
 
-**示例：从 macOS「信息」`chat.db` 轮询读取**（自行放到 `~/.config/easy-proxy/get_sms.py`，按你的短信文案调整关键词/正则）。用 `LOOKBACK_SECS` 往前看、再用短信自带的「有效期截止 HH:MM」精确校验未过期：
+**示例：从 macOS「信息」`chat.db` 轮询读取**（自行放到 `~/.config/easy-proxy/scripts/get_sms.py`，按你的短信文案调整关键词/正则）。用 `LOOKBACK_SECS` 往前看、再用短信自带的「有效期截止 HH:MM」精确校验未过期：
 
 ```python
 #!/usr/bin/env python3

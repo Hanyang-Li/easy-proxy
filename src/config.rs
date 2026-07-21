@@ -108,14 +108,19 @@ pub struct RuntimeState {
 
 #[derive(Debug, Clone)]
 pub struct Paths {
+    /// 静态配置/资源目录 ~/.config/easy-proxy（config.yaml、completions/、scripts/、bin/）
     pub config_dir: PathBuf,
+    /// 运行时目录 ~/.easy-proxy（日志 / 状态 / 临时 cookie，不与配置混放）
+    pub runtime_dir: PathBuf,
     pub app_config: PathBuf,
-    pub state: PathBuf,
+    pub bin_dir: PathBuf,
     pub zju_bin: PathBuf,
-    pub daemon_log: PathBuf,
-    pub tunnel_log: PathBuf,
     pub completions_dir: PathBuf,
     pub completion_file: PathBuf,
+    pub state: PathBuf,
+    pub cookies: PathBuf,
+    pub daemon_log: PathBuf,
+    pub tunnel_log: PathBuf,
     pub zshrc: PathBuf,
 }
 
@@ -123,15 +128,20 @@ impl Paths {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 HOME"))?;
         let config_dir = home.join(".config/easy-proxy");
+        let runtime_dir = home.join(".easy-proxy");
         Ok(Self {
             app_config: config_dir.join("config.yaml"),
-            state: config_dir.join("state.json"),
-            zju_bin: config_dir.join("zju-connect"),
-            daemon_log: config_dir.join("daemon.log"),
-            tunnel_log: config_dir.join("tunnel.log"),
+            bin_dir: config_dir.join("bin"),
+            zju_bin: config_dir.join("bin/zju-connect"),
             completions_dir: config_dir.join("completions"),
             completion_file: config_dir.join("completions/_easy-proxy"),
+            // 运行时产物集中到 ~/.easy-proxy，不塞进配置目录
+            state: runtime_dir.join("state.json"),
+            cookies: runtime_dir.join(".cookies"),
+            daemon_log: runtime_dir.join("daemon.log"),
+            tunnel_log: runtime_dir.join("tunnel.log"),
             zshrc: home.join(".zshrc"),
+            runtime_dir,
             config_dir,
         })
     }
@@ -149,7 +159,7 @@ impl Paths {
     }
 
     pub fn write_state(&self, state: &RuntimeState) -> Result<()> {
-        fs::create_dir_all(&self.config_dir)?;
+        fs::create_dir_all(&self.runtime_dir)?;
         let tmp = self.state.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
         fs::rename(&tmp, &self.state)?;
@@ -158,5 +168,24 @@ impl Paths {
 
     pub fn clear_state(&self) {
         let _ = fs::remove_file(&self.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_layout_config_vs_runtime() {
+        let p = Paths::new().unwrap();
+        // 静态配置/资源留在 ~/.config/easy-proxy
+        assert!(p.app_config.ends_with(".config/easy-proxy/config.yaml"));
+        assert!(p.zju_bin.ends_with(".config/easy-proxy/bin/zju-connect"));
+        assert!(p.completion_file.ends_with(".config/easy-proxy/completions/_easy-proxy"));
+        // 运行时产物集中到 ~/.easy-proxy
+        assert!(p.state.ends_with(".easy-proxy/state.json"));
+        assert!(p.cookies.ends_with(".easy-proxy/.cookies"));
+        assert!(p.daemon_log.ends_with(".easy-proxy/daemon.log"));
+        assert!(p.tunnel_log.ends_with(".easy-proxy/tunnel.log"));
     }
 }
