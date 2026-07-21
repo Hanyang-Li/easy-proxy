@@ -231,14 +231,12 @@ easy-proxy() {{
 }}
 ep() {{
   emulate -L zsh
-  local port
-  if ! port="$(COLUMNS=${{COLUMNS:-80}} "{exe}" port --connected 2>/dev/null)"; then
+  if ! COLUMNS=${{COLUMNS:-80}} "{exe}" port --connected >/dev/null 2>&1; then
     COLUMNS=${{COLUMNS:-80}} "{exe}" status >&2
     return 1
   fi
   (
-    export http_proxy="http://127.0.0.1:$port" https_proxy="http://127.0.0.1:$port" \
-           all_proxy="socks5://127.0.0.1:$port" no_proxy="localhost,127.0.0.1"
+    eval "$(COLUMNS=${{COLUMNS:-80}} "{exe}" restart)" >&2 || exit
     if [[ -n ${{aliases[$1]}} ]]; then
       eval "${{aliases[$1]}} ${{(j: :)${{(@q)@[2,-1]}}}}"
     else
@@ -309,6 +307,8 @@ mod tests {
         let block = zsh_block("/usr/local/bin/easy-proxy");
         assert!(block.contains(r#"start|stop|restart|disconnect) eval "$(COLUMNS=${COLUMNS:-80} "/usr/local/bin/easy-proxy" "$@")" ;;"#));
         assert!(block.contains("ep() {"));
-        assert!(block.contains(r#""/usr/local/bin/easy-proxy" port --connected"#));
+        assert!(block.contains(r#""/usr/local/bin/easy-proxy" port --connected >/dev/null 2>&1"#));
+        assert!(block.contains(r#""/usr/local/bin/easy-proxy" status >&2"#));
+        assert!(block.contains(r#"eval "$(COLUMNS=${COLUMNS:-80} "/usr/local/bin/easy-proxy" restart)" >&2 || exit"#));
     }
 }
