@@ -1,0 +1,260 @@
+//! install：释放内嵌 zju-connect、写默认配置 / zsh 补全 / .zshrc 托管块。
+
+use crate::capsule::success_line;
+use crate::config::{Paths, PromptConfig};
+use anyhow::{Context, Result};
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// 编译期内嵌的 zju-connect 二进制（darwin-arm64, v1.2.0）。
+const ZJU_BIN: &[u8] = include_bytes!("../vendor/zju-connect");
+
+const BLOCK_BEGIN: &str = "# >>> easy-proxy >>>";
+const BLOCK_END: &str = "# <<< easy-proxy <<<";
+
+#[derive(Clone, Copy)]
+enum Action {
+    Set,
+    Updated,
+    Kept,
+}
+
+impl Action {
+    fn label(self) -> &'static str {
+        match self {
+            Action::Set => "已设置",
+            Action::Updated => "已更新",
+            Action::Kept => "已存在",
+        }
+    }
+}
+
+pub fn cmd_install(paths: &Paths) -> Result<()> {
+    fs::create_dir_all(&paths.config_dir)
+        .with_context(|| format!("无法创建 {}", paths.config_dir.display()))?;
+    fs::create_dir_all(&paths.completions_dir)?;
+
+    let cfg_action = ensure_config(paths)?;
+    ensure_zju_bin(paths)?;
+    let comp_action = write_completion(paths)?;
+    let zshrc_action = update_zshrc(paths)?;
+
+    let prompt = PromptConfig::default();
+    println!("{}", install_line(zshrc_action, "环境配置(.zshrc)", &paths.zshrc, &prompt));
+    println!("{}", install_line(comp_action, "补全配置", &paths.completion_file, &prompt));
+    println!("{}", install_line(cfg_action, "默认配置", &paths.app_config, &prompt));
+    println!(
+        "{}",
+        success_line(&format!("zju-connect 已就绪: {}", paths.zju_bin.display()), None, &prompt)
+    );
+    println!(
+        "{}",
+        success_line("完成。执行 source ~/.zshrc 或打开新终端后生效", None, &prompt)
+    );
+    Ok(())
+}
+
+/// 释放内嵌 zju-connect 到配置目录（缺失或大小不符才重写），赋可执行权限并去除隔离属性。
+pub fn ensure_zju_bin(paths: &Paths) -> Result<()> {
+    fs::create_dir_all(&paths.config_dir)?;
+    let need = match fs::metadata(&paths.zju_bin) {
+        Ok(m) => m.len() != ZJU_BIN.len() as u64,
+        Err(_) => true,
+    };
+    if need {
+        fs::write(&paths.zju_bin, ZJU_BIN)
+            .with_context(|| format!("无法写入 {}", paths.zju_bin.display()))?;
+        let mut perm = fs::metadata(&paths.zju_bin)?.permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&paths.zju_bin, perm)?;
+        let _ = Command::new("xattr")
+            .args(["-d", "com.apple.quarantine"])
+            .arg(&paths.zju_bin)
+            .output();
+    }
+    Ok(())
+}
+
+fn ensure_config(paths: &Paths) -> Result<Action> {
+    if paths.app_config.exists() {
+        return Ok(Action::Kept);
+    }
+    fs::write(&paths.app_config, default_config())
+        .with_context(|| format!("无法写入 {}", paths.app_config.display()))?;
+    Ok(Action::Set)
+}
+
+fn default_config() -> String {
+    r#"# easy-proxy 配置：首次安装后请填写 server 与 username
+server: ""            # 深信服 EasyConnect 门户地址，例: vpn.example.com
+port: 443
+username: ""          # 门户登录用户名/邮箱，例: your-name@example.com
+# 本机对外暴露的混合代理端口（http+socks 同一个端口）
+mixed_port: 7899
+prompt:
+  online_icon: "󰌘"
+  offline_icon: "󰌙"
+  delay_icon: "󱦺"
+  port_icon: "󰈀"
+"#
+    .to_string()
+}
+
+fn write_completion(paths: &Paths) -> Result<Action> {
+    let existed = paths.completion_file.exists();
+    fs::write(&paths.completion_file, completion_script())?;
+    Ok(if existed { Action::Updated } else { Action::Set })
+}
+
+fn completion_script() -> &'static str {
+    r#"#compdef easy-proxy
+
+_easy-proxy() {
+  local -a commands
+  commands=(
+    'connect:登录并启动隧道后台守护'
+    'disconnect:停止隧道并清除当前终端代理'
+    'start:为当前终端设置代理环境变量'
+    'stop:移除当前终端代理环境变量'
+    'restart:重新读取端口并更新代理环境变量'
+    'status:显示连接状态胶囊'
+    'port:输出当前端口号'
+    'install:安装 .zshrc、补全与默认配置'
+  )
+  _arguments -s \
+    '(-h --help)'{-h,--help}'[显示帮助信息]' \
+    '1:command:->cmds' \
+    '*::arg:->args'
+  case "$state" in
+    cmds) _describe 'command' commands ;;
+    args)
+      case "$words[1]" in
+        connect) _arguments '--relogin[忽略钥匙串密码，强制重新输入]' ;;
+      esac
+      ;;
+  esac
+}
+
+_easy-proxy "$@"
+"#
+}
+
+fn update_zshrc(paths: &Paths) -> Result<Action> {
+    let exe = current_exe_path();
+    let block = zsh_block(&exe);
+    let original = fs::read_to_string(&paths.zshrc).unwrap_or_default();
+    let action = if original.contains(BLOCK_BEGIN) && original.contains(BLOCK_END) {
+        Action::Updated
+    } else {
+        Action::Set
+    };
+    let updated = replace_managed_block(&original, &block);
+    fs::write(&paths.zshrc, updated)?;
+    Ok(action)
+}
+
+fn current_exe_path() -> String {
+    env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("easy-proxy"))
+        .display()
+        .to_string()
+}
+
+fn zsh_block(exe: &str) -> String {
+    format!(
+        r#"{BLOCK_BEGIN}
+# easy-proxy wrapper (added by easy-proxy install)
+easy-proxy() {{
+  case "$1" in
+    start|stop|restart|disconnect) eval "$(COLUMNS=${{COLUMNS:-80}} "{exe}" "$@")" ;;
+    *) COLUMNS=${{COLUMNS:-80}} "{exe}" "$@" ;;
+  esac
+}}
+ep() {{
+  emulate -L zsh
+  local port
+  if ! port="$(COLUMNS=${{COLUMNS:-80}} "{exe}" port --connected 2>/dev/null)"; then
+    COLUMNS=${{COLUMNS:-80}} "{exe}" status >&2
+    return 1
+  fi
+  (
+    export http_proxy="http://127.0.0.1:$port" https_proxy="http://127.0.0.1:$port" \
+           all_proxy="socks5://127.0.0.1:$port" no_proxy="localhost,127.0.0.1"
+    if [[ -n ${{aliases[$1]}} ]]; then
+      eval "${{aliases[$1]}} ${{(j: :)${{(@q)@[2,-1]}}}}"
+    else
+      "$@"
+    fi
+  )
+}}
+{BLOCK_END}
+"#
+    )
+}
+
+fn replace_managed_block(original: &str, block: &str) -> String {
+    let Some(begin) = original.find(BLOCK_BEGIN) else {
+        let mut out = original.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(block);
+        return out;
+    };
+    let Some(rel_end) = original[begin..].find(BLOCK_END) else {
+        let mut out = original.to_string();
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(block);
+        return out;
+    };
+    let mut end = begin + rel_end + BLOCK_END.len();
+    if original[end..].starts_with('\n') {
+        end += 1;
+    }
+    format!("{}{}{}", &original[..begin], block, &original[end..])
+}
+
+fn install_line(action: Action, name: &str, path: &Path, prompt: &PromptConfig) -> String {
+    success_line(&format!("{}{}: {}", action.label(), name, path.display()), None, prompt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_block_replaces_only_marked_region() {
+        let original = "before\n# >>> easy-proxy >>>\nold\n# <<< easy-proxy <<<\nafter\n";
+        let block = "# >>> easy-proxy >>>\nnew\n# <<< easy-proxy <<<\n";
+        assert_eq!(
+            replace_managed_block(original, block),
+            "before\n# >>> easy-proxy >>>\nnew\n# <<< easy-proxy <<<\nafter\n"
+        );
+    }
+
+    #[test]
+    fn managed_block_appended_when_absent() {
+        let original = "export PATH=/x\n";
+        let block = "# >>> easy-proxy >>>\nx\n# <<< easy-proxy <<<\n";
+        let out = replace_managed_block(original, block);
+        assert!(out.starts_with("export PATH=/x\n"));
+        assert!(out.contains(BLOCK_BEGIN));
+    }
+
+    #[test]
+    fn zsh_block_uses_absolute_exe_and_eval_for_env_commands() {
+        let block = zsh_block("/usr/local/bin/easy-proxy");
+        assert!(block.contains(r#"start|stop|restart|disconnect) eval "$(COLUMNS=${COLUMNS:-80} "/usr/local/bin/easy-proxy" "$@")" ;;"#));
+        assert!(block.contains("ep() {"));
+        assert!(block.contains(r#""/usr/local/bin/easy-proxy" port --connected"#));
+    }
+}

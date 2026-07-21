@@ -1,0 +1,140 @@
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+
+/// 状态胶囊里各段的图标（Nerd Font 私有区字形）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptConfig {
+    pub online_icon: Option<String>,
+    pub offline_icon: Option<String>,
+    pub delay_icon: Option<String>,
+    pub port_icon: Option<String>,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            online_icon: Some("\u{f0318}".to_string()),  // 󰌘 link
+            offline_icon: Some("\u{f0319}".to_string()), // 󰌙 link-off
+            delay_icon: Some("\u{f0b6b}".to_string()),   // 󱭫-ish latency
+            port_icon: Some("\u{f0200}".to_string()),    // 󰈀 ethernet
+        }
+    }
+}
+
+impl PromptConfig {
+    pub fn online(&self) -> &str {
+        self.online_icon.as_deref().unwrap_or("\u{f0318}")
+    }
+    pub fn offline(&self) -> &str {
+        self.offline_icon.as_deref().unwrap_or("\u{f0319}")
+    }
+    pub fn delay(&self) -> &str {
+        self.delay_icon.as_deref().unwrap_or("\u{f0b6b}")
+    }
+    pub fn port(&self) -> &str {
+        self.port_icon.as_deref().unwrap_or("\u{f0200}")
+    }
+}
+
+/// ~/.config/easy-proxy/config.yaml
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppConfig {
+    pub server: String,
+    #[serde(default = "default_https_port")]
+    pub port: u16,
+    pub username: String,
+    #[serde(default = "default_mixed_port")]
+    pub mixed_port: u16,
+    #[serde(default)]
+    pub prompt: PromptConfig,
+}
+
+fn default_https_port() -> u16 {
+    443
+}
+fn default_mixed_port() -> u16 {
+    7899
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            port: 443,
+            username: String::new(),
+            mixed_port: 7899,
+            prompt: PromptConfig::default(),
+        }
+    }
+}
+
+/// 后台守护进程写、其余命令读的运行时状态。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeState {
+    pub connected: bool,
+    pub daemon_pid: i32,
+    pub port: u16,
+    pub socks_upstream: String,
+    pub http_upstream: String,
+    pub server: String,
+    pub tunnel_ip: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub config_dir: PathBuf,
+    pub app_config: PathBuf,
+    pub state: PathBuf,
+    pub zju_bin: PathBuf,
+    pub daemon_log: PathBuf,
+    pub tunnel_log: PathBuf,
+    pub completions_dir: PathBuf,
+    pub completion_file: PathBuf,
+    pub zshrc: PathBuf,
+}
+
+impl Paths {
+    pub fn new() -> Result<Self> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 HOME"))?;
+        let config_dir = home.join(".config/easy-proxy");
+        Ok(Self {
+            app_config: config_dir.join("config.yaml"),
+            state: config_dir.join("state.json"),
+            zju_bin: config_dir.join("zju-connect"),
+            daemon_log: config_dir.join("daemon.log"),
+            tunnel_log: config_dir.join("tunnel.log"),
+            completions_dir: config_dir.join("completions"),
+            completion_file: config_dir.join("completions/_easy-proxy"),
+            zshrc: home.join(".zshrc"),
+            config_dir,
+        })
+    }
+
+    pub fn read_app_config(&self) -> Result<AppConfig> {
+        let input = fs::read_to_string(&self.app_config)
+            .with_context(|| format!("无法读取 {}（请先运行 easy-proxy install）", self.app_config.display()))?;
+        serde_yaml::from_str(&input)
+            .with_context(|| format!("无法解析 {}", self.app_config.display()))
+    }
+
+    pub fn read_state(&self) -> Option<RuntimeState> {
+        let input = fs::read_to_string(&self.state).ok()?;
+        serde_json::from_str(&input).ok()
+    }
+
+    pub fn write_state(&self, state: &RuntimeState) -> Result<()> {
+        fs::create_dir_all(&self.config_dir)?;
+        let tmp = self.state.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
+        fs::rename(&tmp, &self.state)?;
+        Ok(())
+    }
+
+    pub fn clear_state(&self) {
+        let _ = fs::remove_file(&self.state);
+    }
+}

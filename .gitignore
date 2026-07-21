@@ -1,0 +1,11 @@
+# Rust 构建产物
+/target
+
+# 内嵌的第三方二进制（GPL，不纳入仓库；构建前请自行下载放到 vendor/，见 README）
+/vendor
+
+# Claude Code / 本地工具目录
+.claude/
+
+# macOS
+.DS_Store

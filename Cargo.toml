@@ -1,0 +1,25 @@
+[package]
+name = "easy-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.12"
+dirs = "5"
+hex = "0.4"
+libc = "0.2"
+rand = "0.8"
+regex = "1"
+rsa = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "process"] }
+unicode-width = "0.2"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
