@@ -276,6 +276,15 @@ impl StatusLine {
             eprintln!("{text}");
         }
     }
+
+    /// 只清掉进行中的行、不打印新内容（tty）；非 tty 无操作。
+    /// 用于「结果行走 stdout」的场景：先清 stderr 进度行，再由调用方 println 结果。
+    fn clear(&self) {
+        if self.tty {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+    }
 }
 
 /// 短信已下发后，拿到 TWFID：先自动取码（单行原地刷新的「第 N/max 次取码」），
@@ -476,21 +485,17 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     let _ = std::fs::remove_file(&jar);
 
     tunnel::spawn_daemon(paths, cfg, &twfid)?;
-    // 中间提示「正在建立隧道…」：在 tty 上用不换行 + 清行，让最终结果替换掉它
-    let tty = std::io::stderr().is_terminal();
-    if tty {
-        eprint!("  正在建立隧道…");
-        let _ = std::io::stderr().flush();
-    } else {
-        eprintln!("  正在建立隧道…");
-    }
-    let ready = tunnel::wait_ready(paths, std::time::Duration::from_secs(45));
-    if tty {
-        eprint!("\r\x1b[2K"); // 回行首并清行
-        let _ = std::io::stderr().flush();
-    }
-    let st = ready?;
-    let delay = tunnel::probe_latency(st.port, &st.server);
+    // 「连接中…」进度行：覆盖「建隧道就绪」+「延迟探测」整段（否则探测那几秒静默像假死），
+    // 到最后一刻才清行、让 stdout 的「已连接」胶囊接上。
+    let line = StatusLine::new();
+    line.progress("  连接中…");
+    let ready = tunnel::wait_ready(paths, std::time::Duration::from_secs(45))
+        .map(|st| {
+            let delay = tunnel::probe_latency(st.port, &st.server);
+            (st, delay)
+        });
+    line.clear(); // 无论成功失败，先清掉进度行，别让后续输出黏在「连接中…」后面
+    let (st, delay) = ready?;
     let status = ProxyStatus { online: true, delay, port: Some(st.port) };
     println!("{}", success_line("已连接", Some(&status), &cfg.prompt));
     Ok(())
