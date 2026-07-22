@@ -90,6 +90,9 @@ port: 443
 username: "your-name@example.com"
 mixed_port: 7899          # 本机对外暴露的混合端口（避开 clash verge 的 7897 等）
 # sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"   # 可选：自动取码命令（见「自动获取短信验证码」）
+healthcheck_interval: 15         # 隧道健康检查周期（秒），daemon 每隔这么久探一次连通性
+healthcheck_fail_threshold: 2    # 连续探测失败几次判定断线（躲开单次抖动）
+silent_relogin_interval: 3600    # 静默重登最小间隔（秒），按上次发码时刻限流下一次自动重登
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"
@@ -114,6 +117,19 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 - 隧道后端 zju-connect 自带 UDP 保活，隧道可长时间稳定（原版 EasierConnect 无保活，几分钟必掉）。
 - 单混合端口由 easy-proxy 自己实现（zju-connect 只有 socks/http 两个独立端口，无 mixed-port）。
 - 首条短信在 `login_psw`（密码通过）那一刻由服务端下发。需要新码时走 `post_sms.csp`（门户「重新发送验证码」同款接口，约 30s 重发间隔，新旧码各 5 分钟有效）；`login_sms.csp` 只查手机号配置、**不发短信**。
+- daemon 还会每 `healthcheck_interval` 探测一次连通性（详见下节）。
+
+## 断线自动恢复（0.3.0）
+
+daemon 每 `healthcheck_interval`（默认 15s）用延迟探针探一次隧道连通性，连续 `healthcheck_fail_threshold`（默认 2）次失败判定断线，进入**分级恢复**：
+
+1. **先用当前 TWFID 重启 zju-connect**（不发短信、不受频率限制）——切网 / 出地铁 / 短暂断连多半这一步就恢复，零短信。
+2. 仍不通且**配了 `sms_command`** 时，才**静默重新登录**（钥匙串密码 + 自动取码）。此步受 `silent_relogin_interval`（默认 3600s）限流：按**上次发码时刻**算（手动 connect、补发、静默重登的发码都算），距上次发码不足该间隔就不再自动重登，直接转 offline。
+3. 恢复彻底失败（旧 TWFID 失效 + 被限流 / 取不到码 / 未配 `sms_command`）→ daemon 退出、`status` 显示 offline，等你手动 `connect`。
+
+**状态**：`online`（探测通） / 后台重连中（对外仍显示 offline） / `offline`（无守护）。合盖休眠时进程被系统挂起、不占资源，唤醒后立即补探一次。
+
+**手动 `connect` 不受限流**；若后台正在重连，手动 `connect` 会**接管**——停掉后台守护，由前台（有 tty）完整走登录（向手机发码、自动 / 手动取码），与平常 connect 完全一致。
 
 ## 自动化（无 tty / 脚本）
 

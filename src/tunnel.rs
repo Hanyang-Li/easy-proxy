@@ -16,7 +16,7 @@ pub fn pid_alive(pid: i32) -> bool {
 }
 
 /// 以会话首进程（setsid）方式启动脱离终端的守护进程。
-pub fn spawn_daemon(paths: &Paths, cfg: &AppConfig, twfid: &str) -> Result<()> {
+pub fn spawn_daemon(paths: &Paths, cfg: &AppConfig, twfid: &str, last_sms_sent: u64) -> Result<()> {
     fs::create_dir_all(&paths.runtime_dir)?; // 日志/状态都写在这里
     paths.clear_state();
     let exe = std::env::current_exe().context("无法定位自身可执行文件")?;
@@ -30,6 +30,7 @@ pub fn spawn_daemon(paths: &Paths, cfg: &AppConfig, twfid: &str) -> Result<()> {
         .arg("--mixed-port").arg(cfg.mixed_port.to_string())
         .arg("--socks").arg(SOCKS_UPSTREAM)
         .arg("--http").arg(HTTP_UPSTREAM)
+        .arg("--last-sms-sent").arg(last_sms_sent.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
@@ -48,7 +49,7 @@ pub fn wait_ready(paths: &Paths, timeout: Duration) -> Result<RuntimeState> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(st) = paths.read_state() {
-            if st.connected {
+            if st.phase == crate::config::Phase::Online {
                 return Ok(st);
             }
             if let Some(err) = st.error {
@@ -69,9 +70,7 @@ pub fn wait_ready(paths: &Paths, timeout: Duration) -> Result<RuntimeState> {
 }
 
 fn read_tail(paths: &Paths, bytes: usize) -> String {
-    let text = fs::read_to_string(&paths.tunnel_log).unwrap_or_default();
-    let start = text.len().saturating_sub(bytes);
-    text[start..].to_string()
+    crate::config::read_tail_bytes(&paths.tunnel_log, bytes)
 }
 
 /// 通过混合端口探测到网关的延迟（毫秒）。预算 3s，失败重试一次，两次失败为 Timeout。
@@ -108,20 +107,29 @@ pub fn probe_latency(port: u16, server: &str) -> Delay {
     Delay::Timeout
 }
 
-/// 停止守护：先给守护发 SIGTERM（其会杀掉 zju-connect 子进程），再兜底清理并清状态。
-pub fn stop_daemon(paths: &Paths) {
+/// 停止守护并等待其退出（至多 timeout）：SIGTERM（守护会杀掉 zju-connect 子进程）→ 轮询 pid 直到退出
+/// → 兜底 pkill zju-connect → 清状态。connect 方案 Z 靠「等它真退出再 spawn」避免抢 mixed_port。
+pub fn stop_daemon_and_wait(paths: &Paths, timeout: Duration) {
     if let Some(st) = paths.read_state() {
         if st.daemon_pid > 0 && pid_alive(st.daemon_pid) {
             unsafe {
                 libc::kill(st.daemon_pid, libc::SIGTERM);
             }
+            let deadline = Instant::now() + timeout;
+            while pid_alive(st.daemon_pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
-    std::thread::sleep(Duration::from_millis(300));
     // 兜底：清掉可能残留的、由我们释放的 zju-connect
     let _ = Command::new("pkill")
         .arg("-f")
         .arg(paths.zju_bin.display().to_string())
         .output();
     paths.clear_state();
+}
+
+/// 停止守护（默认给 300ms 让其退出），供 disconnect 使用。
+pub fn stop_daemon(paths: &Paths) {
+    stop_daemon_and_wait(paths, Duration::from_millis(300));
 }

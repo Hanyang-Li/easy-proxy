@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 状态胶囊里各段的图标（Nerd Font 私有区字形）。
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +65,15 @@ pub struct AppConfig {
     /// 「被服务端拒后重读」前的等待秒数：给正确的验证码送达 chat.db 的时间（不会重发短信）。默认 30。
     #[serde(default = "default_sms_retry_interval_secs")]
     pub sms_retry_interval_secs: u32,
+    /// 隧道健康检查周期(秒)。daemon 每隔这么久用延迟探针探一次连通性。
+    #[serde(default = "default_healthcheck_interval")]
+    pub healthcheck_interval: u64,
+    /// 连续探测失败几次判定断线(躲开单次抖动)。
+    #[serde(default = "default_healthcheck_fail_threshold")]
+    pub healthcheck_fail_threshold: u32,
+    /// 静默重登最小间隔(秒)。按上次发码时刻算,限流下一次「自动」重登;手动 connect 不受限。
+    #[serde(default = "default_silent_relogin_interval")]
+    pub silent_relogin_interval: u64,
 }
 
 fn default_https_port() -> u16 {
@@ -77,6 +88,15 @@ fn default_sms_retries() -> u32 {
 fn default_sms_retry_interval_secs() -> u32 {
     30
 }
+fn default_healthcheck_interval() -> u64 {
+    15
+}
+fn default_healthcheck_fail_threshold() -> u32 {
+    2
+}
+fn default_silent_relogin_interval() -> u64 {
+    3600
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -89,20 +109,65 @@ impl Default for AppConfig {
             sms_command: None,
             sms_retries: 1,
             sms_retry_interval_secs: 30,
+            healthcheck_interval: 15,
+            healthcheck_fail_threshold: 2,
+            silent_relogin_interval: 3600,
         }
     }
+}
+
+/// daemon 运行阶段。offline 不在此枚举内——它等价于「没有 state 文件」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    Online,
+    Reconnecting,
+}
+
+impl Default for Phase {
+    fn default() -> Self {
+        Phase::Reconnecting
+    }
+}
+
+/// SystemTime → unix 秒(用于 last_sms_sent 等时间戳)。
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 只读文件末尾 ≤max 字节(UTF-8 lossy),避免日志变大后 read_to_string 全文的内存/IO 开销。
+pub fn read_tail_bytes(path: &std::path::Path, max: usize) -> String {
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(max as u64);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).to_string()
 }
 
 /// 后台守护进程写、其余命令读的运行时状态。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeState {
-    pub connected: bool,
+    #[serde(default)]
+    pub phase: Phase,
     pub daemon_pid: i32,
     pub port: u16,
     pub socks_upstream: String,
     pub http_upstream: String,
     pub server: String,
     pub tunnel_ip: String,
+    #[serde(default)]
+    pub last_sms_sent: Option<u64>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -175,6 +240,61 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_default_is_reconnecting() {
+        assert_eq!(Phase::default(), Phase::Reconnecting);
+    }
+
+    #[test]
+    fn runtime_state_roundtrip_and_legacy_compat() {
+        let st = RuntimeState {
+            phase: Phase::Online,
+            daemon_pid: 42,
+            port: 7899,
+            socks_upstream: "127.0.0.1:1080".into(),
+            http_upstream: "127.0.0.1:1081".into(),
+            server: "vpn.example.com".into(),
+            tunnel_ip: "10.0.0.1".into(),
+            last_sms_sent: Some(1000),
+            error: None,
+        };
+        let json = serde_json::to_string(&st).unwrap();
+        let back: RuntimeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phase, Phase::Online);
+        assert_eq!(back.last_sms_sent, Some(1000));
+        // 旧 0.2.x json(有 connected、无 phase/last_sms_sent)应能解析,新字段落默认
+        let legacy = r#"{"connected":true,"daemon_pid":1,"port":7899,"socks_upstream":"a","http_upstream":"b","server":"s","tunnel_ip":"","error":null}"#;
+        let parsed: RuntimeState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.phase, Phase::Reconnecting);
+        assert_eq!(parsed.last_sms_sent, None);
+    }
+
+    #[test]
+    fn appconfig_defaults_present() {
+        let c = AppConfig::default();
+        assert_eq!(c.healthcheck_interval, 15);
+        assert_eq!(c.healthcheck_fail_threshold, 2);
+        assert_eq!(c.silent_relogin_interval, 3600);
+    }
+
+    #[test]
+    fn read_tail_bytes_returns_only_suffix() {
+        let p = std::env::temp_dir().join(format!("ep_tail_test_{}.log", std::process::id()));
+        std::fs::write(&p, "0123456789ABCDEF").unwrap();
+        let tail = read_tail_bytes(&p, 4);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(tail, "CDEF");
+    }
+
+    #[test]
+    fn read_tail_bytes_shorter_than_max_ok() {
+        let p = std::env::temp_dir().join(format!("ep_tail_test2_{}.log", std::process::id()));
+        std::fs::write(&p, "abc").unwrap();
+        let tail = read_tail_bytes(&p, 100);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(tail, "abc");
+    }
 
     #[test]
     fn paths_layout_config_vs_runtime() {

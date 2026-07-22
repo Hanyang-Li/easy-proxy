@@ -9,6 +9,8 @@ mod daemon;
 mod install;
 mod keychain;
 mod login;
+mod recover;
+mod sms;
 mod tunnel;
 
 use capsule::{
@@ -60,7 +62,8 @@ pub fn run() -> Result<()> {
 
     // __serve 与 install 不要求已有配置文件
     if let Commands::Serve(args) = &cli.command {
-        return daemon::serve(args.clone(), &paths);
+        let cfg = paths.read_app_config()?;
+        return daemon::serve(args.clone(), cfg, &paths);
     }
     if let Commands::Install = &cli.command {
         return install::cmd_install(&paths);
@@ -100,28 +103,6 @@ fn wait_sms_file(path: &str) -> Result<String> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-}
-
-/// 取码命令的安全上限：轮询与「往前看多久」的逻辑都在脚本里（示例脚本自行轮询约 60s），
-/// 这里只作防挂死兜底——超过它仍没返回就杀掉子进程、回退手动输入。
-const SMS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
-/// 校验取码输出：去掉首尾空白后，必须是 4–8 位纯数字，否则视作「还没取到」。
-fn valid_sms_code(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && (4..=8).contains(&s.len()) {
-        Some(s.to_string())
-    } else {
-        None
-    }
-}
-
-/// 取码结果：取到码 / 没取到（空 · 超时 · 非法输出）/ 用户按 esc 取消。
-#[derive(Debug, PartialEq)]
-enum SmsFetch {
-    Code(String),
-    Empty,
-    Cancelled,
 }
 
 /// 让终端进入「非规范 + 无回显」模式，以便在取码/等待期间非阻塞探测 esc；drop 时恢复原状。
@@ -196,57 +177,6 @@ fn sleep_cancelable(dur: std::time::Duration, esc: Option<&EscGuard>) -> bool {
     }
 }
 
-/// 执行取码命令（`sh -c <command>`），最多等 `timeout`（防挂死兜底）。
-/// 分工：脚本负责「轮询等码」和「往前看多久 / 是否过期」；easy-proxy 只负责运行它、取回一段输出。
-/// 契约：脚本把 4–8 位验证码打印到 stdout 即视为取到；空输出 / 非数字 / 非零退出 / 超时都视作「没取到」（Empty）。
-/// 期间若 `esc` 探测到 esc 键，杀掉子进程并返回 `Cancelled`。码是否被接受，交由后续 login_sms1（服务端）判定。
-fn run_sms_command(command: &str, timeout: std::time::Duration, esc: Option<&EscGuard>) -> SmsFetch {
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return SmsFetch::Empty,
-    };
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if let Some(e) = esc {
-                    if e.esc_pressed() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return SmsFetch::Cancelled;
-                    }
-                }
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return SmsFetch::Empty;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-            Err(_) => return SmsFetch::Empty,
-        }
-    }
-    let mut out = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        use std::io::Read;
-        let _ = so.read_to_string(&mut out);
-    }
-    match valid_sms_code(&out) {
-        Some(code) => SmsFetch::Code(code),
-        None => SmsFetch::Empty,
-    }
-}
-
 /// 单行原地刷新器：tty 上用 `\r\x1b[2K` 覆盖上一次内容（进度行不换行、结果行换行定格）；
 /// 非 tty 退化为逐行打印（每个状态各占一行，便于日志留痕）。
 struct StatusLine {
@@ -289,7 +219,7 @@ impl StatusLine {
 
 /// 短信已下发后，拿到 TWFID：先自动取码（单行原地刷新的「第 N/max 次取码」），
 /// 成功即返回；没取到 / 被拒到上限 / esc 取消 → 回退手动输入。彻底失败向上抛错。
-fn obtain_twfid(cfg: &AppConfig, jar: &Path, phone: &str) -> Result<String> {
+fn obtain_twfid(cfg: &AppConfig, jar: &Path, phone: &str, on_sms_sent: &dyn Fn()) -> Result<String> {
     // 表头：短信已下发（一次性持久行，位于取码进度行之上）
     let sent = if phone.is_empty() {
         "短信验证码已发送".to_string()
@@ -310,7 +240,7 @@ fn obtain_twfid(cfg: &AppConfig, jar: &Path, phone: &str) -> Result<String> {
         .map(str::trim)
         .filter(|c| !c.is_empty())
     {
-        if let Some(twfid) = auto_fetch_phase(cfg, jar, cmd)? {
+        if let Some(twfid) = auto_fetch_phase(cfg, jar, cmd, on_sms_sent)? {
             return Ok(twfid);
         }
         // 落空（没取到 / 被拒到上限 / esc 取消）→ 手动
@@ -319,68 +249,49 @@ fn obtain_twfid(cfg: &AppConfig, jar: &Path, phone: &str) -> Result<String> {
     manual_phase(cfg, jar)
 }
 
-/// 自动取码主循环：第 1..=auto_max 轮（auto_max = 1 + sms_retries），整段只占屏幕一行、原地刷新。
-/// 每一轮：进下一轮前**统一**等待 sms_retry_interval_secs（首轮不等）——两条失败路径共用等待，
-/// 唯一区别是「上一轮没取到」会先补发一次短信（被拒则不补发）。取到码就提交：
-/// 通过→返回 Some(twfid)；被拒→进下一轮（不补发）；没取到→进下一轮（补发）。
-/// 轮数耗尽 / esc 取消 → 定格失败行并返回 None（调用方回退手动）。
-fn auto_fetch_phase(cfg: &AppConfig, jar: &Path, cmd: &str) -> Result<Option<String>> {
-    let auto_max = 1 + cfg.sms_retries;
-    let retry_wait = std::time::Duration::from_secs(cfg.sms_retry_interval_secs as u64);
-    let esc = EscGuard::new(); // None = 非 tty，无 esc 取消能力
-    let line = StatusLine::new();
-    let hint = if esc.is_some() { " (esc 键取消)" } else { "" };
+/// 前台自动取码:构造 tty UI(原地刷新 + esc 取消)调用 sms 核心;落空返回 None 交由调用方回退手动。
+fn auto_fetch_phase(
+    cfg: &AppConfig,
+    jar: &Path,
+    cmd: &str,
+    on_sms_sent: &dyn Fn(),
+) -> Result<Option<String>> {
+    let ui = TtyUi {
+        line: StatusLine::new(),
+        esc: EscGuard::new(),
+    };
+    sms::fetch_and_submit_loop(cfg, jar, cmd, &ui, on_sms_sent)
+}
 
-    // 上一轮的失败原因：None = 首轮；Some(true) = 没取到（下一轮前补发）；Some(false) = 被拒（不补发）。
-    let mut prev_empty: Option<bool> = None;
-    let mut cancelled = false;
+/// 前台取码 UI:原地刷新进度行,esc 键取消(保留 ISIG,Ctrl-C 仍可中断)。
+struct TtyUi {
+    line: StatusLine,
+    esc: Option<EscGuard>,
+}
 
-    let mut round = 0u32;
-    while round < auto_max {
-        round += 1;
-        line.progress(&format!("  [自动] 第 {round}/{auto_max} 次取码…{hint}"));
-
-        // 非首轮：先（按需）补发一条新码，再统一等待；等待让码送达 chat.db（不因是否补发而不同）。
-        if let Some(was_empty) = prev_empty {
-            if was_empty {
-                if let Err(e) = login::resend_sms(&cfg.server, cfg.port, jar) {
-                    line.finish(&error_line(
-                        &format!("[自动] 补发短信失败：{e}，回退手动输入"),
-                        None,
-                        &cfg.prompt,
-                    ));
-                    return Ok(None);
-                }
-            }
-            if sleep_cancelable(retry_wait, esc.as_ref()) {
-                cancelled = true;
-                break;
-            }
-        }
-
-        match run_sms_command(cmd, SMS_COMMAND_TIMEOUT, esc.as_ref()) {
-            SmsFetch::Cancelled => {
-                cancelled = true;
-                break;
-            }
-            SmsFetch::Empty => prev_empty = Some(true),
-            SmsFetch::Code(code) => match login::submit_sms(&cfg.server, cfg.port, jar, &code)? {
-                login::SmsOutcome::Accepted(twfid) => {
-                    line.finish(&success_line("[自动] 验证码已通过", None, &cfg.prompt));
-                    return Ok(Some(twfid));
-                }
-                login::SmsOutcome::Rejected(_why) => prev_empty = Some(false),
-            },
+impl sms::SmsUi for TtyUi {
+    fn progress(&self, t: &str) {
+        self.line.progress(t);
+    }
+    fn finish_ok(&self, t: &str) {
+        self.line.finish(t);
+    }
+    fn finish_err(&self, t: &str) {
+        self.line.finish(t);
+    }
+    fn is_cancelled(&self) -> bool {
+        self.esc.as_ref().map(|e| e.esc_pressed()).unwrap_or(false)
+    }
+    fn sleep_cancelable(&self, dur: std::time::Duration) -> bool {
+        sleep_cancelable(dur, self.esc.as_ref())
+    }
+    fn cancel_hint(&self) -> &str {
+        if self.esc.is_some() {
+            " (esc 键取消)"
+        } else {
+            ""
         }
     }
-
-    if cancelled {
-        line.finish(&error_line("[自动] 已取消自动取码，转手动输入", None, &cfg.prompt));
-    } else {
-        line.finish(&error_line("[自动] 未取到验证码，回退手动输入", None, &cfg.prompt));
-    }
-    Ok(None)
-    // esc 在此 drop，终端恢复规范模式，交给手动阶段的 dialoguer
 }
 
 /// 手动输入验证码并提交，最多 3 次（格式错误由 dialoguer 当场拦下、不计入）。全错则抛错。
@@ -434,13 +345,21 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             paths.app_config.display()
         ));
     }
-    // 已连接则直接展示状态
+    // 已有守护:online 直接展示;reconnecting(方案 Z)则停掉它、由本次登录接管重连(daemon 无 tty,
+    // 手动输码这条路只能前台走)。停旧 + 等其退出后,后续照常登录 + spawn 新 daemon,与全新 connect 同路径。
     if let Some(st) = paths.read_state() {
-        if st.connected && tunnel::pid_alive(st.daemon_pid) {
-            let delay = tunnel::probe_latency(st.port, &st.server);
-            let status = ProxyStatus { online: true, delay, port: Some(st.port) };
-            println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
-            return Ok(());
+        if tunnel::pid_alive(st.daemon_pid) {
+            if st.phase == config::Phase::Online {
+                let delay = tunnel::probe_latency(st.port, &st.server);
+                let status = ProxyStatus { online: true, delay, port: Some(st.port) };
+                println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
+                return Ok(());
+            }
+            eprintln!(
+                "{}",
+                success_line("检测到后台正在重连,改由本次登录接管", None, &cfg.prompt)
+            );
+            tunnel::stop_daemon_and_wait(paths, std::time::Duration::from_secs(5));
         }
     }
 
@@ -455,6 +374,10 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             .ok()
             .or_else(|| keychain::get_password(&cfg.username))
     };
+
+    // 记录本次登录「最后一次发码」的时刻(初次下发 + 补发都刷新),连接后传给 daemon 作静默重登限流基线。
+    let last_sms = std::cell::Cell::new(0u64);
+    let on_sms_sent = || last_sms.set(config::now_unix());
 
     let twfid = loop {
         let (pwd, from_user) = match password.take() {
@@ -473,8 +396,9 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
                 // 下一轮 password 为 None → 交互重输
             }
             login::PwOutcome::SmsSent { phone } => {
-                // 短信已发（密码正确）→ 取码 + 提交，拿到 TWFID。取码彻底失败会向上抛错。
-                let twfid = obtain_twfid(cfg, &jar, &phone)?;
+                // 短信已发（密码正确）→ 记发码时刻 → 取码 + 提交，拿到 TWFID。取码彻底失败会向上抛错。
+                on_sms_sent();
+                let twfid = obtain_twfid(cfg, &jar, &phone, &on_sms_sent)?;
                 if from_user {
                     keychain::set_password(&cfg.username, &pwd)?;
                 }
@@ -484,7 +408,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     };
     let _ = std::fs::remove_file(&jar);
 
-    tunnel::spawn_daemon(paths, cfg, &twfid)?;
+    tunnel::spawn_daemon(paths, cfg, &twfid, last_sms.get())?;
     // 「连接中…」进度行：覆盖「建隧道就绪」+「延迟探测」整段（否则探测那几秒静默像假死），
     // 到最后一刻才清行、让 stdout 的「已连接」胶囊接上。
     let line = StatusLine::new();
@@ -516,7 +440,7 @@ fn cmd_disconnect(paths: &Paths, cfg: &AppConfig) -> Result<()> {
 fn connected_state(paths: &Paths) -> Option<config::RuntimeState> {
     paths
         .read_state()
-        .filter(|s| s.connected && tunnel::pid_alive(s.daemon_pid))
+        .filter(|s| s.phase == config::Phase::Online && tunnel::pid_alive(s.daemon_pid))
 }
 
 fn cmd_start(paths: &Paths, cfg: &AppConfig) -> Result<()> {
@@ -600,51 +524,3 @@ fn cmd_port(paths: &Paths, cfg: &AppConfig, connected_only: bool) -> Result<()> 
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn valid_code_accepts_4_to_8_digits() {
-        assert_eq!(valid_sms_code(" 929869 \n"), Some("929869".to_string()));
-        assert_eq!(valid_sms_code("1234"), Some("1234".to_string()));
-        assert_eq!(valid_sms_code("12345678"), Some("12345678".to_string()));
-    }
-
-    #[test]
-    fn valid_code_rejects_junk() {
-        assert_eq!(valid_sms_code(""), None);
-        assert_eq!(valid_sms_code("   "), None);
-        assert_eq!(valid_sms_code("123"), None); // 太短
-        assert_eq!(valid_sms_code("123456789"), None); // 太长
-        assert_eq!(valid_sms_code("code:123456"), None); // 非纯数字
-        assert_eq!(valid_sms_code("abcd"), None);
-    }
-
-    #[test]
-    fn command_stdout_code_is_returned() {
-        assert_eq!(
-            run_sms_command("echo 654321", Duration::from_secs(5), None),
-            SmsFetch::Code("654321".to_string())
-        );
-    }
-
-    #[test]
-    fn command_no_valid_output_is_empty() {
-        assert_eq!(run_sms_command("true", Duration::from_secs(5), None), SmsFetch::Empty);
-        assert_eq!(run_sms_command("exit 1", Duration::from_secs(5), None), SmsFetch::Empty);
-        assert_eq!(
-            run_sms_command("echo not-a-code", Duration::from_secs(5), None),
-            SmsFetch::Empty
-        );
-    }
-
-    #[test]
-    fn command_timeout_kills_and_returns_empty() {
-        let start = Instant::now();
-        let code = run_sms_command("sleep 5; echo 123456", Duration::from_millis(300), None);
-        assert_eq!(code, SmsFetch::Empty);
-        assert!(start.elapsed() < Duration::from_secs(3), "应在超时后立即返回，不等满 5s");
-    }
-}
