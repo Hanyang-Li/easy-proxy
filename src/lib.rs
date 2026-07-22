@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
+use std::path::Path;
 
 mod capsule;
 mod config;
@@ -246,6 +247,177 @@ fn run_sms_command(command: &str, timeout: std::time::Duration, esc: Option<&Esc
     }
 }
 
+/// 单行原地刷新器：tty 上用 `\r\x1b[2K` 覆盖上一次内容（进度行不换行、结果行换行定格）；
+/// 非 tty 退化为逐行打印（每个状态各占一行，便于日志留痕）。
+struct StatusLine {
+    tty: bool,
+}
+
+impl StatusLine {
+    fn new() -> Self {
+        StatusLine { tty: std::io::stderr().is_terminal() }
+    }
+
+    /// 刷成一条「进行中」的行：tty 上覆盖并停在行尾（等待被后续内容替换）。
+    fn progress(&self, text: &str) {
+        if self.tty {
+            eprint!("\r\x1b[2K{text}");
+            let _ = std::io::stderr().flush();
+        } else {
+            eprintln!("{text}");
+        }
+    }
+
+    /// 定格一条最终结果行：覆盖掉进行中的行并换行。
+    fn finish(&self, text: &str) {
+        if self.tty {
+            eprintln!("\r\x1b[2K{text}");
+        } else {
+            eprintln!("{text}");
+        }
+    }
+}
+
+/// 短信已下发后，拿到 TWFID：先自动取码（单行原地刷新的「第 N/max 次取码」），
+/// 成功即返回；没取到 / 被拒到上限 / esc 取消 → 回退手动输入。彻底失败向上抛错。
+fn obtain_twfid(cfg: &AppConfig, jar: &Path, phone: &str) -> Result<String> {
+    // 表头：短信已下发（一次性持久行，位于取码进度行之上）
+    let sent = if phone.is_empty() {
+        "短信验证码已发送".to_string()
+    } else {
+        format!("短信验证码已发送至 {phone}")
+    };
+    eprintln!("{}", success_line(&sent, None, &cfg.prompt));
+
+    // 自动化钩子：设置 EASY_PROXY_SMS_FILE 时从文件读码，便于脚本/无 tty 场景
+    if let Ok(path) = std::env::var("EASY_PROXY_SMS_FILE") {
+        return automation_via_file(cfg, jar, &path);
+    }
+
+    // 自动取码阶段（配了 sms_command 才启用）
+    if let Some(cmd) = cfg
+        .sms_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        if let Some(twfid) = auto_fetch_phase(cfg, jar, cmd)? {
+            return Ok(twfid);
+        }
+        // 落空（没取到 / 被拒到上限 / esc 取消）→ 手动
+    }
+
+    manual_phase(cfg, jar)
+}
+
+/// 自动取码主循环：第 1..=auto_max 轮（auto_max = 1 + sms_retries），整段只占屏幕一行、原地刷新。
+/// 每一轮：进下一轮前**统一**等待 sms_retry_interval_secs（首轮不等）——两条失败路径共用等待，
+/// 唯一区别是「上一轮没取到」会先补发一次短信（被拒则不补发）。取到码就提交：
+/// 通过→返回 Some(twfid)；被拒→进下一轮（不补发）；没取到→进下一轮（补发）。
+/// 轮数耗尽 / esc 取消 → 定格失败行并返回 None（调用方回退手动）。
+fn auto_fetch_phase(cfg: &AppConfig, jar: &Path, cmd: &str) -> Result<Option<String>> {
+    let auto_max = 1 + cfg.sms_retries;
+    let retry_wait = std::time::Duration::from_secs(cfg.sms_retry_interval_secs as u64);
+    let esc = EscGuard::new(); // None = 非 tty，无 esc 取消能力
+    let line = StatusLine::new();
+    let hint = if esc.is_some() { " (esc 键取消)" } else { "" };
+
+    // 上一轮的失败原因：None = 首轮；Some(true) = 没取到（下一轮前补发）；Some(false) = 被拒（不补发）。
+    let mut prev_empty: Option<bool> = None;
+    let mut cancelled = false;
+
+    let mut round = 0u32;
+    while round < auto_max {
+        round += 1;
+        line.progress(&format!("  [自动] 第 {round}/{auto_max} 次取码…{hint}"));
+
+        // 非首轮：先（按需）补发一条新码，再统一等待；等待让码送达 chat.db（不因是否补发而不同）。
+        if let Some(was_empty) = prev_empty {
+            if was_empty {
+                if let Err(e) = login::resend_sms(&cfg.server, cfg.port, jar) {
+                    line.finish(&error_line(
+                        &format!("[自动] 补发短信失败：{e}，回退手动输入"),
+                        None,
+                        &cfg.prompt,
+                    ));
+                    return Ok(None);
+                }
+            }
+            if sleep_cancelable(retry_wait, esc.as_ref()) {
+                cancelled = true;
+                break;
+            }
+        }
+
+        match run_sms_command(cmd, SMS_COMMAND_TIMEOUT, esc.as_ref()) {
+            SmsFetch::Cancelled => {
+                cancelled = true;
+                break;
+            }
+            SmsFetch::Empty => prev_empty = Some(true),
+            SmsFetch::Code(code) => match login::submit_sms(&cfg.server, cfg.port, jar, &code)? {
+                login::SmsOutcome::Accepted(twfid) => {
+                    line.finish(&success_line("[自动] 验证码已通过", None, &cfg.prompt));
+                    return Ok(Some(twfid));
+                }
+                login::SmsOutcome::Rejected(_why) => prev_empty = Some(false),
+            },
+        }
+    }
+
+    if cancelled {
+        line.finish(&error_line("[自动] 已取消自动取码，转手动输入", None, &cfg.prompt));
+    } else {
+        line.finish(&error_line("[自动] 未取到验证码，回退手动输入", None, &cfg.prompt));
+    }
+    Ok(None)
+    // esc 在此 drop，终端恢复规范模式，交给手动阶段的 dialoguer
+}
+
+/// 手动输入验证码并提交，最多 3 次（格式错误由 dialoguer 当场拦下、不计入）。全错则抛错。
+fn manual_phase(cfg: &AppConfig, jar: &Path) -> Result<String> {
+    const MANUAL_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MANUAL_ATTEMPTS {
+        let code: String = dialoguer::Input::new()
+            .with_prompt("短信验证码")
+            .validate_with(|s: &String| -> Result<(), &str> {
+                if s.trim().chars().all(|c| c.is_ascii_digit()) && (4..=8).contains(&s.trim().len()) {
+                    Ok(())
+                } else {
+                    Err("应为 4-8 位数字")
+                }
+            })
+            .interact_text()?;
+        match login::submit_sms(&cfg.server, cfg.port, jar, code.trim())? {
+            login::SmsOutcome::Accepted(twfid) => return Ok(twfid),
+            login::SmsOutcome::Rejected(why) => eprintln!(
+                "{}",
+                error_line(
+                    &format!("验证码错误（{why}），剩余 {} 次", MANUAL_ATTEMPTS - attempt),
+                    None,
+                    &cfg.prompt
+                )
+            ),
+        }
+    }
+    Err(anyhow!("验证码连续 {MANUAL_ATTEMPTS} 次错误"))
+}
+
+/// 无 tty / 脚本场景：从 EASY_PROXY_SMS_FILE 轮询读码并提交，被拒则重读，最多 3 次。
+fn automation_via_file(cfg: &AppConfig, jar: &Path, path: &str) -> Result<String> {
+    const FILE_ATTEMPTS: u32 = 3;
+    for attempt in 1..=FILE_ATTEMPTS {
+        let code = wait_sms_file(path)?;
+        match login::submit_sms(&cfg.server, cfg.port, jar, &code)? {
+            login::SmsOutcome::Accepted(twfid) => return Ok(twfid),
+            login::SmsOutcome::Rejected(why) => {
+                eprintln!("  [自动化] 验证码被拒（{why}），剩余 {} 次", FILE_ATTEMPTS - attempt)
+            }
+        }
+    }
+    Err(anyhow!("[自动化] 验证码连续 {FILE_ATTEMPTS} 次被拒"))
+}
+
 fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     if cfg.server.trim().is_empty() || cfg.username.trim().is_empty() {
         return Err(anyhow!(
@@ -275,18 +447,6 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             .or_else(|| keychain::get_password(&cfg.username))
     };
 
-    // 自动取码额度与重试节奏（仅在配置了 sms_command 时启用自动）：
-    // 总自动提交次数 = 1（首次）+ sms_retries（重试）；login_sms1 总次数再加 3 次手动兜底。
-    let auto_enabled = cfg
-        .sms_command
-        .as_deref()
-        .map(str::trim)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    let auto_max: u32 = if auto_enabled { 1 + cfg.sms_retries } else { 0 };
-    let retry_wait = std::time::Duration::from_secs(cfg.sms_retry_interval_secs as u64);
-    let max_attempts = auto_max + 3;
-
     let twfid = loop {
         let (pwd, from_user) = match password.take() {
             Some(p) => (p, false),
@@ -298,139 +458,18 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             }
         };
 
-        // 本次登录（每次密码尝试重置）的自动取码状态。两种「重取」触发：
-        //  · 服务端拒码（本闭包被再次调用，auto_done>0）→ 等一会儿让「正确的码」送达后重读，绝不重发短信；
-        //  · 脚本没取到码（空/超时）→ 补发一次短信（整轮登录仅一次）后立即重取，因为多半是短信还没到。
-        // ESC：自动期间按 esc 立即杀掉取码脚本、放弃剩余自动额度、本轮登录余下都转手动。
-        let mut auto_done: u32 = 0;
-        let mut resent = false; // 是否已补发过短信（硬限一次，别循环发 SMS）
-        let mut auto_off = false; // ESC 取消后，本轮登录余下都走手动
-        let mut sms = |phone: &str, resend: &mut dyn FnMut() -> Result<()>| -> Result<String> {
-            let msg = if phone.is_empty() {
-                "短信验证码已发送".to_string()
-            } else {
-                format!("短信验证码已发送至 {phone}")
-            };
-            eprintln!("{}", success_line(&msg, None, &cfg.prompt));
-            // 自动化钩子：设置 EASY_PROXY_SMS_FILE 时轮询该文件读取验证码，便于脚本/无 tty 场景
-            if let Ok(path) = std::env::var("EASY_PROXY_SMS_FILE") {
-                return wait_sms_file(&path);
+        match login::login_password(&cfg.server, cfg.port, &cfg.username, &pwd, &jar)? {
+            login::PwOutcome::PasswordRejected(msg) => {
+                eprintln!("{}", error_line(&format!("密码被拒: {msg}，请重新输入"), None, &cfg.prompt));
+                // 下一轮 password 为 None → 交互重输
             }
-            // 可插拔自动取码：config.sms_command 配了才启用。脚本自行轮询/判断有效期，
-            // 取到即用；没取到就补发一次再取；被拒则等待后重读；ESC / 额度用尽回退手动。
-            if let Some(cmd) = cfg
-                .sms_command
-                .as_deref()
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-            {
-                if auto_off {
-                    // 之前已按 esc 取消（取消时已提示），静默走手动
-                } else if auto_done >= auto_max {
-                    eprintln!(
-                        "{}",
-                        error_line("[自动] 自动取码已达上限，回退手动输入", None, &cfg.prompt)
-                    );
-                } else {
-                    let esc = EscGuard::new(); // None = 非 tty，无 esc 取消能力
-                    let tty = std::io::stderr().is_terminal();
-
-                    // 拒码重试：闭包被再次调用（auto_done>0）说明上一个自动码被服务端拒。
-                    // 等一会儿让「正确的码」送达 chat.db、盖过旧码后再重读——绝不重发短信。
-                    let mut cancelled = if auto_done > 0 {
-                        eprintln!(
-                            "  [自动] 上一个验证码被拒，等待 {}s 后重读（不重发短信）…",
-                            cfg.sms_retry_interval_secs
-                        );
-                        sleep_cancelable(retry_wait, esc.as_ref())
-                    } else {
-                        false
-                    };
-
-                    while !cancelled && auto_done < auto_max {
-                        auto_done += 1;
-                        // 「取码中…」作为进度行：tty 上不换行，拿到结果后清行替换（同「建立隧道→已连接」）
-                        let hint = if esc.is_some() { " (esc 键取消)" } else { "" };
-                        let progress = format!("  [自动] 第 {auto_done}/{auto_max} 次取码…{hint}");
-                        if tty {
-                            eprint!("{progress}");
-                            let _ = std::io::stderr().flush();
-                        } else {
-                            eprintln!("{progress}");
-                        }
-                        let outcome = run_sms_command(cmd, SMS_COMMAND_TIMEOUT, esc.as_ref());
-                        if tty {
-                            eprint!("\r\x1b[2K"); // 回行首并清行，让结果替换掉进度行
-                            let _ = std::io::stderr().flush();
-                        }
-                        match outcome {
-                            SmsFetch::Code(code) => {
-                                eprintln!("{}", success_line("[自动] 已获取验证码", None, &cfg.prompt));
-                                return Ok(code); // EscGuard 在返回时 drop，恢复终端
-                            }
-                            SmsFetch::Cancelled => cancelled = true,
-                            SmsFetch::Empty => {
-                                // 没取到码：短信多半还没到 → 补发一次再取（仅一次，且需还有额度）
-                                if !resent && auto_done < auto_max {
-                                    resent = true;
-                                    eprintln!("  [自动] 未取到验证码，补发短信后重取（仅一次）…");
-                                    if let Err(e) = resend() {
-                                        eprintln!(
-                                            "{}",
-                                            error_line(
-                                                &format!("[自动] 补发短信失败：{e}"),
-                                                None,
-                                                &cfg.prompt
-                                            )
-                                        );
-                                        break; // 转手动
-                                    }
-                                    // 立即重取：取码脚本自行轮询、等新短信落库
-                                } else {
-                                    break; // 没额度 / 已补发过 → 转手动
-                                }
-                            }
-                        }
-                    }
-
-                    if cancelled {
-                        auto_off = true;
-                        eprintln!(
-                            "{}",
-                            error_line("[自动] 已取消自动取码，转手动输入", None, &cfg.prompt)
-                        );
-                    } else {
-                        eprintln!(
-                            "{}",
-                            error_line("[自动] 未取到验证码，回退手动输入", None, &cfg.prompt)
-                        );
-                    }
-                    // EscGuard 在此 drop，终端恢复规范模式，交给下面的 dialoguer
-                }
-            }
-            let code: String = dialoguer::Input::new()
-                .with_prompt("短信验证码")
-                .validate_with(|s: &String| -> Result<(), &str> {
-                    if s.trim().chars().all(|c| c.is_ascii_digit()) && (4..=8).contains(&s.trim().len()) {
-                        Ok(())
-                    } else {
-                        Err("应为 4-8 位数字")
-                    }
-                })
-                .interact_text()?;
-            Ok(code.trim().to_string())
-        };
-
-        match login::login(&cfg.server, cfg.port, &cfg.username, &pwd, &jar, max_attempts, &mut sms)? {
-            login::LoginOutcome::Ok(twfid) => {
+            login::PwOutcome::SmsSent { phone } => {
+                // 短信已发（密码正确）→ 取码 + 提交，拿到 TWFID。取码彻底失败会向上抛错。
+                let twfid = obtain_twfid(cfg, &jar, &phone)?;
                 if from_user {
                     keychain::set_password(&cfg.username, &pwd)?;
                 }
                 break twfid;
-            }
-            login::LoginOutcome::PasswordRejected(msg) => {
-                eprintln!("{}", error_line(&format!("密码被拒: {msg}，请重新输入", ), None, &cfg.prompt));
-                // 下一轮 password 为 None → 交互重输
             }
         }
     };

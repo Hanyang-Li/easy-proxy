@@ -1,6 +1,7 @@
 //! 深信服 EasyConnect 门户纯 HTTP 登录（无浏览器）。
 //! 流程: login_auth → psw_config(拿 RSA/CSRF) → RSA(password_csrf) → login_psw
-//!       → login_sms(触发短信) → 交互输入 → login_sms1 → 认证后的 TWFID。
+//!       → login_sms(触发短信) → login_sms1(提交验证码) → 认证后的 TWFID。
+//! 对外拆成三步：login_password / resend_sms / submit_sms，重试主循环交由调用方编排。
 //! 用 curl 维持会话 cookie，RSA 本地做。
 
 use anyhow::{anyhow, Context, Result};
@@ -18,11 +19,18 @@ pub const PROXY_ENV: [&str; 10] = [
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "FTP_PROXY",
 ];
 
-pub enum LoginOutcome {
-    /// 认证成功，携带可直接喂给 zju-connect 的 TWFID。
-    Ok(String),
-    /// 密码被拒（发生在短信之前，未消耗验证码），调用方应重新索取密码后重试。
+/// login_password 的结果。SmsSent：密码/RSA 通过、网关已下发短信（附掩码手机号，可能为空）；
+/// PasswordRejected：凭据被拒（发生在短信之前、未消耗验证码），调用方应重新索取密码后重试。
+pub enum PwOutcome {
+    SmsSent { phone: String },
     PasswordRejected(String),
+}
+
+/// submit_sms 的结果。Accepted：验证码通过，携带可直接喂给 zju-connect 的 TWFID；
+/// Rejected：验证码被服务端拒，携带原因（调用方决定重取还是回退手动）。
+pub enum SmsOutcome {
+    Accepted(String),
+    Rejected(String),
 }
 
 /// login_psw 的结果。Ready 表示密码/RSA 通过、服务端已下发短信；Rejected 表示凭据被拒。
@@ -76,62 +84,61 @@ fn pre_sms(base: &str, username: &str, password: &str, jar: &Path) -> Result<Pre
     }
 }
 
-/// 取码回调：入参是已掩码的手机号（可能为空）和「补发一次短信」的钩子，返回要提交的验证码。
-/// 回调可在「脚本没取到码」时调用该钩子重发短信；被服务端拒时则不该调用它。
-pub type SmsCallback<'a> = dyn FnMut(&str, &mut dyn FnMut() -> Result<()>) -> Result<String> + 'a;
-
-/// sms 回调入参是已掩码的手机号（可能为空），返回用户输入的验证码。
-pub fn login(
+/// 步骤 1-5：login_auth → psw_config → RSA → login_psw → login_sms。
+/// 密码/RSA 通过时网关**即下发短信**；返回掩码手机号（可能为空）。密码被拒则未消耗短信。
+pub fn login_password(
     server: &str,
     port: u16,
     username: &str,
     password: &str,
     jar: &Path,
-    max_attempts: u32,
-    sms: &mut SmsCallback<'_>,
-) -> Result<LoginOutcome> {
+) -> Result<PwOutcome> {
     let base = format!("https://{server}:{port}");
     match pre_sms(&base, username, password, jar)? {
-        PreSms::Rejected(msg) => return Ok(LoginOutcome::PasswordRejected(msg)),
+        PreSms::Rejected(msg) => return Ok(PwOutcome::PasswordRejected(msg)),
         PreSms::Ready => {}
     }
+    // 5. login_sms：触发/确认短信下发；顺便解析掩码手机号（供中文提示）
+    let phone = parse_phone(&curl_post(&base, "/por/login_sms.csp?apiversion=1", &[], jar)?);
+    Ok(PwOutcome::SmsSent { phone })
+}
 
-    // 5. login_sms：触发/确认短信下发
-    let sms_resp = curl_post(&base, "/por/login_sms.csp?apiversion=1", &[], jar)?;
-    // 取手机号（T_SMSINFOR 里通常已掩码，兜底看 USER_PHONE），传给回调用于中文提示
-    let phone = find(&sms_resp, r"<T_SMSINFOR>(.*?)</T_SMSINFOR>")
-        .and_then(|s| extract_phone(&s))
-        .or_else(|| find(&sms_resp, r"<USER_PHONE><!\[CDATA\[(.*?)\]\]></USER_PHONE>"))
-        .or_else(|| find(&sms_resp, r"<USER_PHONE>(.*?)</USER_PHONE>"))
-        .map(|p| mask_phone(&p))
-        .unwrap_or_default();
+/// 重发短信：再触发一次 login_sms.csp 下发（用于「取码没取到、需要一条新码」）。
+pub fn resend_sms(server: &str, port: u16, jar: &Path) -> Result<()> {
+    let base = format!("https://{server}:{port}");
+    curl_post(&base, "/por/login_sms.csp?apiversion=1", &[], jar).map(|_| ())
+}
 
-    // 6. login_sms1：提交验证码，最多 max_attempts 次（自动取码额度 + 手动兜底）。
-    //    本步只重复提交、不重发短信；仅当回调「没取到码」时经 resend 补发一次（再打一次 login_sms.csp）。
-    let max_attempts = max_attempts.max(1);
-    // 供回调在「脚本没取到码」时补发一次短信：重新触发 login_sms.csp 下发。
-    let mut resend = || -> Result<()> {
-        curl_post(&base, "/por/login_sms.csp?apiversion=1", &[], jar).map(|_| ())
-    };
-    for attempt in 1..=max_attempts {
-        let code = sms(&phone, &mut resend)?;
-        let resp = curl_post(
-            &base,
-            "/por/login_sms1.csp?apiversion=1",
-            &[("svpn_inputsms", code.trim())],
-            jar,
-        )?;
-        if resp.contains("<Result>1</Result>") || resp.contains("Auth sms suc") {
-            let twfid = find(&resp, r"<TwfID>([0-9a-fA-F]{16})</TwfID>")
-                .or_else(|| twfid_from_jar(jar))
-                .ok_or_else(|| anyhow!("认证成功但未解析到 TWFID"))?;
-            return Ok(LoginOutcome::Ok(twfid.to_lowercase()));
-        }
+/// 提交一个验证码（login_sms1）。只提交、**绝不触发短信下发**。
+/// Accepted 携带 TWFID；Rejected 携带服务端给的原因。
+pub fn submit_sms(server: &str, port: u16, jar: &Path, code: &str) -> Result<SmsOutcome> {
+    let base = format!("https://{server}:{port}");
+    let resp = curl_post(
+        &base,
+        "/por/login_sms1.csp?apiversion=1",
+        &[("svpn_inputsms", code.trim())],
+        jar,
+    )?;
+    if resp.contains("<Result>1</Result>") || resp.contains("Auth sms suc") {
+        let twfid = find(&resp, r"<TwfID>([0-9a-fA-F]{16})</TwfID>")
+            .or_else(|| twfid_from_jar(jar))
+            .ok_or_else(|| anyhow!("认证成功但未解析到 TWFID"))?;
+        Ok(SmsOutcome::Accepted(twfid.to_lowercase()))
+    } else {
         let why = find(&resp, r"<Message><!\[CDATA\[(.*?)\]\]></Message>")
             .unwrap_or_else(|| "验证码校验失败".to_string());
-        eprintln!("  验证码错误（{why}），剩余 {} 次", max_attempts - attempt);
+        Ok(SmsOutcome::Rejected(why))
     }
-    Err(anyhow!("验证码连续 {max_attempts} 次错误"))
+}
+
+/// 从 login_sms 响应里抓掩码手机号：T_SMSINFOR 通常已掩码，兜底看 USER_PHONE。
+fn parse_phone(sms_resp: &str) -> String {
+    find(sms_resp, r"<T_SMSINFOR>(.*?)</T_SMSINFOR>")
+        .and_then(|s| extract_phone(&s))
+        .or_else(|| find(sms_resp, r"<USER_PHONE><!\[CDATA\[(.*?)\]\]></USER_PHONE>"))
+        .or_else(|| find(sms_resp, r"<USER_PHONE>(.*?)</USER_PHONE>"))
+        .map(|p| mask_phone(&p))
+        .unwrap_or_default()
 }
 
 fn rsa_encrypt(key_hex: &str, exp: u64, plaintext: &str) -> Result<String> {
