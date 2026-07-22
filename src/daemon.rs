@@ -224,14 +224,25 @@ async fn restart_zju(child: &mut Child, paths: &Paths, args: &ServeArgs, twfid: 
     wait_socks_ready(paths, child, Duration::from_secs(30)).await
 }
 
-/// 通过混合端口探测连通性(true=通)。同步 curl,丢 spawn_blocking。
+/// 探测连通性(true=通)。同步 curl,丢 spawn_blocking。
+///
+/// 关键:探针**直连 zju-connect 的 http 上游(如 127.0.0.1:1081)**,绝不走 mixed_port——
+/// mixed_port 的转发靠本 daemon 主循环 accept,而探测/恢复期间主循环正阻塞在这里、不 accept,
+/// 若探 mixed_port 必然自锁超时、假报断线(0.3.0 的健康检查因此从未真正工作)。直连上游由
+/// zju-connect 独立进程处理,不受主循环阻塞影响,语义上也直接测「隧道→网关」是否通。
 async fn probe(args: &ServeArgs) -> bool {
-    let (port, server) = (args.mixed_port, args.server.clone());
+    let port = http_upstream_port(&args.http);
+    let server = args.server.clone();
     tokio::task::spawn_blocking(move || {
         !matches!(crate::tunnel::probe_latency(port, &server), crate::capsule::Delay::Timeout)
     })
     .await
     .unwrap_or(false)
+}
+
+/// 从 "127.0.0.1:1081" 解析出上游端口(供探针直连,绕过 mixed_port relay);解析失败回退 1081。
+fn http_upstream_port(http: &str) -> u16 {
+    http.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(1081)
 }
 
 enum RecoverOutcome {
@@ -402,6 +413,13 @@ fn tail(paths: &Paths) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn http_upstream_port_parses_and_falls_back() {
+        assert_eq!(http_upstream_port("127.0.0.1:1081"), 1081);
+        assert_eq!(http_upstream_port("127.0.0.1:1234"), 1234);
+        assert_eq!(http_upstream_port("garbage"), 1081); // 无端口 → 回退
+    }
 
     /// 起一个假上游：接收 1 字节，回一个标记字节表明自己是谁，并返回收到的字节。
     async fn dummy_upstream(tag: u8) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
