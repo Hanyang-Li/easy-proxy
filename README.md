@@ -104,7 +104,7 @@ prompt:
 ## 架构
 
 ```
-connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw→[短信]→login_sms1)──▶ TWFID
+connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw[发短信]→login_sms1[提交码]；重发走 post_sms)──▶ TWFID
         └─▶ 后台守护 easy-proxy __serve
                ├─ 拉起 zju-connect  (socks 127.0.0.1:1080 / http 127.0.0.1:1081，内部)
                └─ 混合端口 127.0.0.1:<mixed_port>：按首字节嗅探
@@ -113,7 +113,7 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 
 - 隧道后端 zju-connect 自带 UDP 保活，隧道可长时间稳定（原版 EasierConnect 无保活，几分钟必掉）。
 - 单混合端口由 easy-proxy 自己实现（zju-connect 只有 socks/http 两个独立端口，无 mixed-port）。
-- 登录时的短信在 `login_psw`（密码通过）那一刻由服务端下发，`login_sms` 在冷却期内不会重复发；每次 `connect` 只发一条。
+- 首条短信在 `login_psw`（密码通过）那一刻由服务端下发。需要新码时走 `post_sms.csp`（门户「重新发送验证码」同款接口，约 30s 重发间隔，新旧码各 5 分钟有效）；`login_sms.csp` 只查手机号配置、**不发短信**。
 
 ## 自动化（无 tty / 脚本）
 
@@ -128,23 +128,23 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 
 ```yaml
 sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"
-sms_retries: 1               # 自动码被拒后重读几次（不重发短信），默认 1
-sms_retry_interval_secs: 30  # 每次重试前等待秒数，默认 30
+sms_retries: 1               # 自动取码额度：总轮数=1+该值。没取到会补发新码，被拒则复用不重发。默认 1
+sms_retry_interval_secs: 30  # 每轮进下一轮前统一等待秒数，默认 30
 ```
 
 - 配了就用：`connect` 发出验证码后执行该命令；脚本取到就自动填入，取不到则**回退手动输入**，不会卡死。
 - 优先级：`EASY_PROXY_SMS_FILE`（若设置）> `sms_command` > 手动输入。
 - easy-proxy 本身**不含任何读码逻辑、也不内置脚本**——取码逻辑完全由你的命令决定，仓库不收录该脚本。
-- **重试不重发**：自动码被服务端拒时按 `sms_retries`（默认 1）重试；每次重试前先等 `sms_retry_interval_secs`（默认 30s）让**正确的**码送达后再重读，**绝不重发新短信**（第一次常读到还没到货的旧码，等一下重读就对了；重发反而重蹈覆辙）。重试用尽仍失败才回退手动。总的 `login_sms1` 提交次数 = (1 + `sms_retries`) 次自动 + 3 次手动兜底。
+- **重试节奏**：总自动取码轮数 = 1 + `sms_retries`（默认 2；屏幕上「第 N/总数 次取码」原地刷新**一行**显示，中途不打失败结果，只有成功/耗尽/取消才定格）。每轮进下一轮前统一等 `sms_retry_interval_secs`（默认 30s，首轮不等）；两条失败路径**唯一区别**是——上一轮「没取到码」会先经 `post_sms.csp` 补发一条**新码**再取，「被服务端拒」则复用现有码、不重发。轮数用尽 / 自动期间按 `esc` 取消 → 回退手动（手动最多 3 次）。
 
 **分工**（谁负责什么）：
 
 | 负责方 | 职责 |
 |---|---|
 | **你的脚本** | 轮询等码、决定「往前看多久」、本地是否过期。取到就把 4–8 位码打到 stdout（`exit 0`）；暂时没有就 `exit 1` 或空输出。轮询与超时都在脚本里（示例约 60s）。 |
-| **easy-proxy** | 只 `sh -c` 跑一次命令、取回一段输出（safety cap 90s，防脚本挂死）。拿到码交 `login_sms1` 让**服务端**判真假；被拒时本次登录**自动只试一次、之后转手动**；没取到（空/非零/超时）直接回退手动输入。 |
+| **easy-proxy** | 只 `sh -c` 跑一次命令、取回一段输出（safety cap 90s，防脚本挂死）。拿到码交 `login_sms1` 让**服务端**判真假；被拒 → 下一轮复用重读（不重发）；没取到 → 下一轮经 `post_sms.csp` 补发新码后重读；轮数用尽 / `esc` 取消才回退手动。 |
 
-> **为什么判据是「有效期」而不是「本次登录后才收到」**：深信服门户在约 5 分钟内不会重发短信，而是要你复用上一条码。所以脚本该找「仍在有效期内的最新一条码」（无论是刚发的还是被复用的旧的），而不是死等一条新短信。
+> **为什么判据是「有效期」而不是「本次登录后才收到」**：被服务端拒时 easy-proxy 不重发、要你复用现有码（5 分钟内仍有效）；仅当「没取到」才 `post_sms.csp` 补发新码（约 30s 间隔）。所以脚本该找「仍在有效期内的最新一条码」（刚发的或仍有效的旧的都行），而不是死等一条"本次登录后"的新短信。
 
 **示例：从 macOS「信息」`chat.db` 轮询读取**（自行放到 `~/.config/easy-proxy/scripts/get_sms.py`，按你的短信文案调整关键词/正则）。用 `LOOKBACK_SECS` 往前看、再用短信自带的「有效期截止 HH:MM」精确校验未过期：
 

@@ -103,10 +103,19 @@ pub fn login_password(
     Ok(PwOutcome::SmsSent { phone })
 }
 
-/// 重发短信：再触发一次 login_sms.csp 下发（用于「取码没取到、需要一条新码」）。
+/// 重发短信：调用 `post_sms.csp` 真正下发一条**新**验证码（对应门户「重新发送验证码」按钮）。
+/// 服务端有约 30s 的重发间隔（响应里的 `SmsSendInterval`），到点即发一条新码，新旧码各 5 分钟有效。
+/// 注意：`login_sms.csp` 只是查手机号配置、**并不发短信**（门户 auth_sms.js: getSmsConfig）；
+/// 真正发送/重发一律走 `post_sms.csp`（getSmsCode，单手机号默认端点），参数与门户一致。
 pub fn resend_sms(server: &str, port: u16, jar: &Path) -> Result<()> {
     let base = format!("https://{server}:{port}");
-    curl_post(&base, "/por/login_sms.csp?apiversion=1", &[], jar).map(|_| ())
+    curl_post(
+        &base,
+        "/por/post_sms.csp?apiversion=1",
+        &[("phone_number", ""), ("phone_index", "0")],
+        jar,
+    )
+    .map(|_| ())
 }
 
 /// 提交一个验证码（login_sms1）。只提交、**绝不触发短信下发**。
