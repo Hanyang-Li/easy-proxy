@@ -14,7 +14,8 @@ mod sms;
 mod tunnel;
 
 use capsule::{
-    error_line, format_capsule, shell_single_quote, success_line, terminal_width, Delay, ProxyStatus,
+    error_line, format_capsule, info_line, shell_single_quote, success_line, terminal_width, Delay,
+    ProxyStatus,
 };
 use config::{AppConfig, Paths};
 
@@ -80,6 +81,11 @@ pub fn run() -> Result<()> {
         Commands::Port { connected } => cmd_port(&paths, &cfg, connected),
         Commands::Install | Commands::Serve(_) => unreachable!(),
     }
+}
+
+/// 顶层错误输出(供 main 使用):红叉 + 消息,无胶囊,不依赖具体配置。
+pub fn top_error(message: &str) -> String {
+    capsule::error_line(message, None, &config::PromptConfig::default())
 }
 
 /// 自动化：轮询文件读取验证码（最多 180s），供脚本/无 tty 场景。
@@ -331,7 +337,14 @@ fn automation_via_file(cfg: &AppConfig, jar: &Path, path: &str) -> Result<String
         match login::submit_sms(&cfg.server, cfg.port, jar, &code)? {
             login::SmsOutcome::Accepted(twfid) => return Ok(twfid),
             login::SmsOutcome::Rejected(why) => {
-                eprintln!("  [自动化] 验证码被拒（{why}），剩余 {} 次", FILE_ATTEMPTS - attempt)
+                eprintln!(
+                    "{}",
+                    error_line(
+                        &format!("[自动化] 验证码被拒（{why}），剩余 {} 次", FILE_ATTEMPTS - attempt),
+                        None,
+                        &cfg.prompt
+                    )
+                )
             }
         }
     }
@@ -357,7 +370,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
             }
             eprintln!(
                 "{}",
-                success_line("检测到后台正在重连,改由本次登录接管", None, &cfg.prompt)
+                info_line("检测到后台正在重连,改由本次登录接管", None, &cfg.prompt)
             );
             tunnel::stop_daemon_and_wait(paths, std::time::Duration::from_secs(5));
         }

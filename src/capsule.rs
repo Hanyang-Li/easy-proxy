@@ -167,6 +167,17 @@ pub fn error_line(message: &str, status: Option<&ProxyStatus>, prompt: &PromptCo
     out
 }
 
+/// 中性 / 进行中 / 无对错的提示:空出 logo 位(两个空格,与 `✔ `/`✘ ` 前缀等宽),
+/// 使文案左边缘与成功 / 错误行对齐。
+pub fn info_line(message: &str, status: Option<&ProxyStatus>, prompt: &PromptConfig) -> String {
+    let mut out = format!("  {message}");
+    if let Some(status) = status {
+        out.push(' ');
+        out.push_str(&format_capsule(status, prompt, terminal_width(), display_width(message) + 3));
+    }
+    out
+}
+
 fn normalize(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -261,4 +272,23 @@ pub fn terminal_width() -> usize {
 
 pub fn shell_single_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logo_slot_widths_align() {
+        // ✔/✘ 前缀与中性两空格前缀显示宽度一致,保证三类提示文案左边缘对齐
+        assert_eq!(display_width("✔ "), 2);
+        assert_eq!(display_width("✘ "), 2);
+        assert_eq!(display_width("  "), 2);
+    }
+
+    #[test]
+    fn info_line_reserves_logo_slot() {
+        let p = PromptConfig::default();
+        assert_eq!(info_line("连接中…", None, &p), "  连接中…");
+    }
 }

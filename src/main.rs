@@ -1,6 +1,6 @@
 fn main() {
     if let Err(error) = easy_proxy::run() {
-        eprintln!("错误: {error:#}");
+        eprintln!("{}", easy_proxy::top_error(&format!("{error:#}")));
         std::process::exit(1);
     }
 }
