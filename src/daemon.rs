@@ -160,6 +160,11 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
         Shutdown,
     }
 
+    // 网络变化防抖截止点:收到首个事件后 1.5s 再统一探测。用「截止点 + select 分支」而非
+    // 同步排空事件流——后者会阻塞主循环不 accept,把 mixed_port 上的真实流量卡住
+    // (0.4.0 的事故:status 探针 1.5s 超时,每隔几秒闪一次假 reconnecting)。
+    let mut net_check_at: Option<tokio::time::Instant> = None;
+
     loop {
         let ev = tokio::select! {
             accepted = listener.accept() => {
@@ -177,7 +182,12 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
             }
             line = next_route_line(&mut route_lines), if route_lines.is_some() => {
                 match line {
-                    Some(l) if is_route_event(&l) => Ev::NetChange,
+                    Some(l) if is_route_event(&l) => {
+                        if net_check_at.is_none() {
+                            net_check_at = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+                        }
+                        Ev::Continue
+                    }
                     Some(_) => Ev::Continue,
                     None => {
                         route_lines = None;
@@ -185,6 +195,10 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
                         Ev::Continue
                     }
                 }
+            }
+            _ = tokio::time::sleep_until(net_check_at.unwrap_or_else(tokio::time::Instant::now)), if net_check_at.is_some() => {
+                net_check_at = None;
+                Ev::NetChange
             }
             _ = tick.tick() => Ev::Probe,
             _ = notify.notified() => Ev::Shutdown,
@@ -194,7 +208,6 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
             Ev::Continue => {}
             Ev::Shutdown => break,
             Ev::NetChange => {
-                drain_route_events(&mut route_lines).await;
                 if probe(&args, state.vpn_dns.as_deref()).await {
                     fails = 0; // 网络变化但隧道仍通(次要接口变动等),无事
                 } else {
@@ -482,10 +495,11 @@ fn spawn_route_monitor() -> Option<(Child, RouteLines)> {
     Some((child, BufReader::new(stdout).lines()))
 }
 
-/// route monitor 输出里只有消息类型行(RTM_*)算网络变化事件;
-/// 其余是 "got message of size ..." 头和字段 payload,忽略。
+/// 只认接口/地址级变化(真实切网必伴随):RTM_IFINFO(链路状态)、RTM_NEWADDR/RTM_DELADDR
+/// (地址增删)。绝不能匹配所有 RTM_*:空闲机器上 awdl0(AirDrop)每隔几秒就 RTM_ADD 邻居
+/// 主机路由(真机实测),普通流量也会产生 RTM_ADD/RTM_GET 噪音——0.4.0 因此每几秒误触发一次。
 fn is_route_event(line: &str) -> bool {
-    line.starts_with("RTM_")
+    line.starts_with("RTM_IFINFO") || line.starts_with("RTM_NEWADDR") || line.starts_with("RTM_DELADDR")
 }
 
 /// 读下一行路由事件;None(流结束/未启用)由调用方处理降级。
@@ -493,21 +507,6 @@ async fn next_route_line(lines: &mut Option<RouteLines>) -> Option<String> {
     match lines {
         Some(l) => l.next_line().await.ok().flatten(),
         None => None, // select! 的 if 守卫保证不会走到
-    }
-}
-
-/// 防抖:切网会在几秒内连发一串路由消息,排空到连续 1.5s 无新事件为止,再让调用方动手探测。
-async fn drain_route_events(lines: &mut Option<RouteLines>) {
-    loop {
-        let Some(l) = lines.as_mut() else { return };
-        match tokio::time::timeout(Duration::from_millis(1500), l.next_line()).await {
-            Err(_) => return,                   // 1.5s 安静 → 抖动结束
-            Ok(Ok(Some(_))) => continue,        // 还在抖,继续排空
-            Ok(_) => {
-                *lines = None;                  // 流结束/IO 错误 → 降级为纯定时探测
-                return;
-            }
-        }
     }
 }
 
@@ -589,10 +588,17 @@ mod tests {
 
     #[test]
     fn route_event_lines_detected() {
-        // route -n monitor 的消息类型行才算事件
+        // 接口/地址级变化才算事件(真实切网必伴随)
         assert!(is_route_event("RTM_NEWADDR: address being added to iface: len 176"));
+        assert!(is_route_event("RTM_DELADDR: address being removed from iface: len 176"));
         assert!(is_route_event("RTM_IFINFO: iface status change: len 168, if# 12"));
-        assert!(is_route_event("RTM_DELETE: Delete Route: len 172"));
+        // 主机路由增删是日常噪音,不算——真机实测 awdl0(AirDrop)每隔几秒就来一条,
+        // 0.4.0 把它当切网导致每几秒假 reconnecting 一次
+        assert!(!is_route_event(
+            "RTM_ADD: Add Route: len 140, pid: 726, seq 155420, errno 0, flags:<HOST,DONE,STATIC>"
+        ));
+        assert!(!is_route_event("RTM_DELETE: Delete Route: len 172"));
+        assert!(!is_route_event("RTM_GET: Report Metrics: len 140"));
         // 消息头与 payload 行忽略
         assert!(!is_route_event("got message of size 176 on Wed Jul 23 15:30:00 2026"));
         assert!(!is_route_event(" locks:  inits: "));
