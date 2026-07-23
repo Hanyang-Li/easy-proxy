@@ -363,7 +363,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     if let Some(st) = paths.read_state() {
         if tunnel::pid_alive(st.daemon_pid) {
             if st.phase == config::Phase::Online {
-                let delay = tunnel::probe_latency(st.port, &st.server);
+                let delay = tunnel::probe_state_latency(&st);
                 let status = ProxyStatus { online: true, delay, port: Some(st.port) };
                 println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
                 return Ok(());
@@ -428,7 +428,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     line.progress("  连接中…");
     let ready = tunnel::wait_ready(paths, std::time::Duration::from_secs(45))
         .map(|st| {
-            let delay = tunnel::probe_latency(st.port, &st.server);
+            let delay = tunnel::probe_state_latency(&st);
             (st, delay)
         });
     line.clear(); // 无论成功失败，先清掉进度行，别让后续输出黏在「连接中…」后面
@@ -514,7 +514,7 @@ fn emit_shell_error(message: &str, cfg: &AppConfig) {
 fn cmd_status(paths: &Paths, cfg: &AppConfig) -> Result<()> {
     let status = match connected_state(paths) {
         Some(st) => {
-            let delay = tunnel::probe_latency(st.port, &st.server);
+            let delay = tunnel::probe_state_latency(&st);
             ProxyStatus { online: true, delay, port: Some(st.port) }
         }
         None => ProxyStatus { online: false, delay: Delay::Hidden, port: None },

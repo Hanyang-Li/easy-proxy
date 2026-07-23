@@ -119,9 +119,11 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 - 首条短信在 `login_psw`（密码通过）那一刻由服务端下发。需要新码时走 `post_sms.csp`（门户「重新发送验证码」同款接口，约 30s 重发间隔，新旧码各 5 分钟有效）；`login_sms.csp` 只查手机号配置、**不发短信**。
 - daemon 还会每 `healthcheck_interval` 探测一次连通性（详见下节）。
 
-## 断线自动恢复（0.3.0）
+## 断线自动恢复（0.3.0，探针 0.3.1 修正）
 
-daemon 每 `healthcheck_interval`（默认 15s）用延迟探针探一次隧道连通性，连续 `healthcheck_fail_threshold`（默认 2）次失败判定断线，进入**分级恢复**：
+daemon 每 `healthcheck_interval`（默认 15s）探一次隧道连通性，连续 `healthcheck_fail_threshold`（默认 2）次失败判定断线，进入**分级恢复**。
+
+探针**穿隧道探测**：SOCKS5 CONNECT 到服务端下发的 VPN DNS（如 `10.0.104.104:53`），TCP 握手必须穿过隧道往返，能测出「隧道假死」。0.3.0 曾探 `https://{server}/`，但网关地址被 zju-connect 路由为 DIRECT（直连不进隧道），切网后隧道已死探针仍绿、ssh 却超时。若日志里解析不到 VPN DNS、或新隧道上探不通 DNS:53（如 DNS 不答 TCP），自动降级回网关直连探测（行为同 0.3.0，只对「彻底断网」敏感）。`status` 的延迟数字同样穿隧道测（经混合端口），不再显示假延迟。
 
 1. **先用当前 TWFID 重启 zju-connect**（不发短信、不受频率限制）——切网 / 出地铁 / 短暂断连多半这一步就恢复，零短信。
 2. 仍不通且**配了 `sms_command`** 时，才**静默重新登录**（钥匙串密码 + 自动取码）。此步受 `silent_relogin_interval`（默认 3600s）限流：按**上次发码时刻**算（手动 connect、补发、静默重登的发码都算），距上次发码不足该间隔就不再自动重登，直接转 offline。

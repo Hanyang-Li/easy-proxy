@@ -62,6 +62,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
         http_upstream: args.http.clone(),
         server: args.server.clone(),
         tunnel_ip: String::new(),
+        vpn_dns: None,
         last_sms_sent: if args.last_sms_sent == 0 { None } else { Some(args.last_sms_sent) },
         error: None,
     };
@@ -78,7 +79,10 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
         .with_context(|| format!("无法启动 {}", paths.zju_bin.display()))?;
 
     match wait_socks_ready(paths, &mut child, Duration::from_secs(30)).await {
-        Ok(ip) => state.tunnel_ip = ip,
+        Ok(info) => {
+            state.tunnel_ip = info.ip;
+            state.vpn_dns = pick_probe_target(&args, info.vpn_dns).await;
+        }
         Err(e) => {
             let _ = child.start_kill();
             state.error = Some(e.to_string());
@@ -167,7 +171,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
             Ev::Continue => {}
             Ev::Shutdown => break,
             Ev::Probe => {
-                if probe(&args).await {
+                if probe(&args, state.vpn_dns.as_deref()).await {
                     fails = 0; // online:不打日志、不重写 state
                 } else {
                     fails += 1;
@@ -205,8 +209,8 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// 用给定 twfid 重启 zju-connect:回收旧进程 → truncate 日志 → 起新进程 → 等 SOCKS 就绪,返回 ip。
-async fn restart_zju(child: &mut Child, paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<String> {
+/// 用给定 twfid 重启 zju-connect:回收旧进程 → truncate 日志 → 起新进程 → 等 SOCKS 就绪。
+async fn restart_zju(child: &mut Child, paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<ReadyInfo> {
     let _ = child.start_kill();
     let _ = child.wait().await; // 回收旧进程,杜绝僵尸
     let log = std::fs::File::create(&paths.tunnel_log)
@@ -224,13 +228,27 @@ async fn restart_zju(child: &mut Child, paths: &Paths, args: &ServeArgs, twfid: 
     wait_socks_ready(paths, child, Duration::from_secs(30)).await
 }
 
-/// 探测连通性(true=通)。同步 curl,丢 spawn_blocking。
+/// 探测连通性(true=通)。同步实现,丢 spawn_blocking。
 ///
-/// 关键:探针**直连 zju-connect 的 http 上游(如 127.0.0.1:1081)**,绝不走 mixed_port——
+/// 两种模式:
+/// - `vpn_dns=Some`:SOCKS5 CONNECT 到 VPN DNS:53,**穿隧道**测数据面(网关地址被
+///   zju-connect 路由为 DIRECT,curl 网关只能测直连,切网后隧道假死时照样绿——0.3.0 的坑)。
+/// - `vpn_dns=None`:回退 curl 直连网关(退化行为,对隧道假死不敏感)。
+///
+/// 关键:两种模式都**直连 zju-connect 上游(1080/1081),绝不走 mixed_port**——
 /// mixed_port 的转发靠本 daemon 主循环 accept,而探测/恢复期间主循环正阻塞在这里、不 accept,
-/// 若探 mixed_port 必然自锁超时、假报断线(0.3.0 的健康检查因此从未真正工作)。直连上游由
-/// zju-connect 独立进程处理,不受主循环阻塞影响,语义上也直接测「隧道→网关」是否通。
-async fn probe(args: &ServeArgs) -> bool {
+/// 若探 mixed_port 必然自锁超时、假报断线。直连上游由 zju-connect 独立进程处理,不受影响。
+async fn probe(args: &ServeArgs, vpn_dns: Option<&str>) -> bool {
+    if let Some(ip) = vpn_dns.and_then(|d| d.parse::<std::net::Ipv4Addr>().ok()) {
+        let socks = args.socks.clone();
+        return tokio::task::spawn_blocking(move || {
+            (0..2).any(|_| {
+                crate::tunnel::socks_probe(&socks, ip, 53, Duration::from_secs(3)).is_some()
+            })
+        })
+        .await
+        .unwrap_or(false);
+    }
     let port = http_upstream_port(&args.http);
     let server = args.server.clone();
     tokio::task::spawn_blocking(move || {
@@ -238,6 +256,28 @@ async fn probe(args: &ServeArgs) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// 在**刚建好的隧道**上选定探针目标:解析到 VPN DNS 且穿隧道探针立即可用 → 用它;
+/// 否则降级为网关直连探测(None)。新隧道刚完成 ECAgent 认证+TLS 建链,此刻探针不通
+/// 大概率是目标不可用(如 DNS 不答 TCP 53)而非隧道问题——若不降级,探针会永远假死,
+/// 看门狗反复重启最后把 daemon 拖下线。降级后行为等同 0.3.0(活着但对隧道假死不敏感)。
+async fn pick_probe_target(args: &ServeArgs, parsed_dns: Option<String>) -> Option<String> {
+    match parsed_dns {
+        Some(dns) => {
+            if probe(args, Some(&dns)).await {
+                eprintln!("[daemon] 健康检查:穿隧道探测 VPN DNS {dns}:53");
+                Some(dns)
+            } else {
+                eprintln!("[daemon] 穿隧道探针(VPN DNS {dns}:53)在新隧道上不通,降级为网关直连探测");
+                None
+            }
+        }
+        None => {
+            eprintln!("[daemon] 未从日志解析到 VPN DNS,健康检查降级为网关直连探测(对隧道假死不敏感)");
+            None
+        }
+    }
 }
 
 /// 从 "127.0.0.1:1081" 解析出上游端口(供探针直连,绕过 mixed_port relay);解析失败回退 1081。
@@ -264,9 +304,11 @@ async fn attempt_recover(
     // step1: 旧 TWFID 重启(不吃闸门)
     if !shutdown.load(Ordering::Relaxed) {
         match restart_zju(child, paths, args, current_twfid).await {
-            Ok(ip) => {
-                if probe(args).await {
-                    state.tunnel_ip = ip;
+            Ok(info) => {
+                // 新隧道上重选探针目标(必要时降级),再按选定目标验活
+                state.tunnel_ip = info.ip;
+                state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
+                if probe(args, state.vpn_dns.as_deref()).await {
                     eprintln!("[daemon] 旧 TWFID 重启成功");
                     return RecoverOutcome::Online;
                 }
@@ -319,9 +361,10 @@ async fn attempt_recover(
     };
     *current_twfid = new_twfid.clone();
     match restart_zju(child, paths, args, &new_twfid).await {
-        Ok(ip) => {
-            if probe(args).await {
-                state.tunnel_ip = ip;
+        Ok(info) => {
+            state.tunnel_ip = info.ip;
+            state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
+            if probe(args, state.vpn_dns.as_deref()).await {
                 eprintln!("[daemon] 静默重登并重启成功");
                 RecoverOutcome::Online
             } else {
@@ -377,7 +420,24 @@ async fn relay(client: TcpStream, socks: String, http: String) -> Result<()> {
     Ok(())
 }
 
-async fn wait_socks_ready(paths: &Paths, child: &mut Child, timeout: Duration) -> Result<String> {
+/// zju-connect 就绪信息：隧道虚拟 IP + 服务端下发的 VPN DNS（穿隧道探针的目标）。
+struct ReadyInfo {
+    ip: String,
+    vpn_dns: Option<String>,
+}
+
+/// 从 tunnel.log 解析服务端下发/显式配置的 VPN DNS 地址。
+fn parse_vpn_dns(text: &str) -> Option<String> {
+    let use_re = Regex::new(r"Use DNS server\s+([\d.]+)").unwrap();
+    let set_re = Regex::new(r"Set DNS server:\s*([\d.]+)").unwrap();
+    use_re
+        .captures(text)
+        .or_else(|| set_re.captures(text))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+async fn wait_socks_ready(paths: &Paths, child: &mut Child, timeout: Duration) -> Result<ReadyInfo> {
     let deadline = Instant::now() + timeout;
     let ip_re = Regex::new(r"Client IP:\s*([\d.]+)").unwrap();
     let ip_re2 = Regex::new(r"your IP:\s*([\d.]+)").unwrap();
@@ -396,7 +456,7 @@ async fn wait_socks_ready(paths: &Paths, child: &mut Child, timeout: Duration) -
                 .and_then(|c| c.get(1))
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
-            return Ok(ip);
+            return Ok(ReadyInfo { ip, vpn_dns: parse_vpn_dns(&text) });
         }
         if Instant::now() >= deadline {
             return Err(anyhow!("等待 zju-connect SOCKS 就绪超时\n{}", tail(paths)));
@@ -413,6 +473,27 @@ fn tail(paths: &Paths) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn parse_vpn_dns_from_real_log() {
+        // 取自真机 tunnel.log
+        let log = "2026/07/23 15:30:03 Client IP: 2.0.1.6\n\
+                   2026/07/23 15:30:03 Use DNS server 10.0.104.104 provided by server\n\
+                   2026/07/23 15:30:03 SOCKS5 server listening on 127.0.0.1:1080\n";
+        assert_eq!(parse_vpn_dns(log), Some("10.0.104.104".to_string()));
+    }
+
+    #[test]
+    fn parse_vpn_dns_set_variant() {
+        // 显式配置 DNS 时 zju-connect 的日志格式
+        let log = "2026/07/23 15:30:03 Set DNS server: 10.10.0.21\n";
+        assert_eq!(parse_vpn_dns(log), Some("10.10.0.21".to_string()));
+    }
+
+    #[test]
+    fn parse_vpn_dns_absent_is_none() {
+        assert_eq!(parse_vpn_dns("SOCKS5 server listening on 127.0.0.1:1080"), None);
+    }
 
     #[test]
     fn http_upstream_port_parses_and_falls_back() {

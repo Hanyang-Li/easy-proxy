@@ -107,6 +107,68 @@ pub fn probe_latency(port: u16, server: &str) -> Delay {
     Delay::Timeout
 }
 
+/// 面向 CLI(status/connect)的延迟探测:state 带 vpn_dns → SOCKS5 穿隧道探测
+/// (经 mixed_port,首字节 0x05 会被 relay 到 socks 上游,顺带验证转发层);
+/// 否则回退 curl 直连网关(旧行为,对隧道假死不敏感)。预算 3s×2 次,与旧探针一致。
+pub fn probe_state_latency(st: &RuntimeState) -> Delay {
+    if let Some(ip) = st.vpn_dns.as_deref().and_then(|d| d.parse().ok()) {
+        let mixed = format!("127.0.0.1:{}", st.port);
+        for _ in 0..2 {
+            if let Some(d) = socks_probe(&mixed, ip, 53, Duration::from_secs(3)) {
+                return Delay::Value((d.as_millis() as u64).max(1));
+            }
+        }
+        return Delay::Timeout;
+    }
+    probe_latency(st.port, &st.server)
+}
+
+/// 穿隧道活性探针：经 SOCKS5 代理向 target:port 发起 CONNECT，测的是隧道数据面本身。
+///
+/// 判活标准：收到完整 SOCKS 应答且 rep ∈ {0x00 成功, 0x05 对端拒绝}——两者都要求 TCP 握手
+/// （SYN/SYN-ACK 或 RST）真正穿过隧道往返；超时、无应答、其他 rep（unreachable/failure
+/// 多为本地快速失败）均判死。返回 Some(耗时) 表示活。
+///
+/// 背景：旧探针 curl 到 `https://{server}/`，而网关地址被 zju-connect 路由为 DIRECT
+/// （tunnel.log:`111.207.219.226:443 -> DIRECT`），测的只是本机直连网关，切网后隧道
+/// 已死探针仍绿，看门狗形同虚设。
+pub fn socks_probe(
+    socks_addr: &str,
+    target: std::net::Ipv4Addr,
+    port: u16,
+    timeout: Duration,
+) -> Option<Duration> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let addr: SocketAddr = socks_addr.parse().ok()?;
+    let start = Instant::now();
+    let mut s = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    s.set_read_timeout(Some(timeout)).ok()?;
+    s.set_write_timeout(Some(timeout)).ok()?;
+    let _ = s.set_nodelay(true);
+
+    // 协商：无认证
+    s.write_all(&[0x05, 0x01, 0x00]).ok()?;
+    let mut method = [0u8; 2];
+    s.read_exact(&mut method).ok()?;
+    if method != [0x05, 0x00] {
+        return None;
+    }
+
+    // CONNECT target:port（ATYP=IPv4）
+    let o = target.octets();
+    let p = port.to_be_bytes();
+    s.write_all(&[0x05, 0x01, 0x00, 0x01, o[0], o[1], o[2], o[3], p[0], p[1]])
+        .ok()?;
+    let mut reply = [0u8; 2];
+    s.read_exact(&mut reply).ok()?;
+    match reply {
+        [0x05, 0x00] | [0x05, 0x05] => Some(start.elapsed()),
+        _ => None,
+    }
+}
+
 /// 停止守护并等待其退出（至多 timeout）：SIGTERM（守护会杀掉 zju-connect 子进程）→ 轮询 pid 直到退出
 /// → 兜底 pkill zju-connect → 清状态。connect 方案 Z 靠「等它真退出再 spawn」避免抢 mixed_port。
 pub fn stop_daemon_and_wait(paths: &Paths, timeout: Duration) {
@@ -132,4 +194,78 @@ pub fn stop_daemon_and_wait(paths: &Paths, timeout: Duration) {
 /// 停止守护（默认给 300ms 让其退出），供 disconnect 使用。
 pub fn stop_daemon(paths: &Paths) {
     stop_daemon_and_wait(paths, Duration::from_millis(300));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+
+    /// 假 SOCKS5 服务器：完成无认证协商后按 `reply` 回应 CONNECT；reply 为空则收下请求但不回应答。
+    fn fake_socks(reply: Vec<u8>) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut greeting = [0u8; 3];
+            let _ = s.read_exact(&mut greeting);
+            let _ = s.write_all(&[0x05, 0x00]); // 无认证
+            let mut req = [0u8; 10];
+            let _ = s.read_exact(&mut req);
+            if !reply.is_empty() {
+                let _ = s.write_all(&reply);
+            }
+            // 挂住连接直到对端关闭，模拟「不应答」时探针只能靠超时
+            let mut sink = [0u8; 16];
+            let _ = s.read(&mut sink);
+        });
+        addr
+    }
+
+    const TARGET: Ipv4Addr = Ipv4Addr::new(10, 0, 104, 104);
+    const SHORT: Duration = Duration::from_millis(500);
+
+    fn ok_reply(rep: u8) -> Vec<u8> {
+        vec![0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn socks_probe_success_reply_is_alive() {
+        let addr = fake_socks(ok_reply(0x00));
+        assert!(socks_probe(&addr, TARGET, 53, SHORT).is_some());
+    }
+
+    #[test]
+    fn socks_probe_connection_refused_reply_is_alive() {
+        // rep=0x05（对端拒绝）说明 RST 穿隧道回来了，数据面是活的
+        let addr = fake_socks(ok_reply(0x05));
+        assert!(socks_probe(&addr, TARGET, 53, SHORT).is_some());
+    }
+
+    #[test]
+    fn socks_probe_unreachable_reply_is_dead() {
+        // rep=0x04 host unreachable：没有证据流量穿过了隧道
+        let addr = fake_socks(ok_reply(0x04));
+        assert!(socks_probe(&addr, TARGET, 53, SHORT).is_none());
+    }
+
+    #[test]
+    fn socks_probe_no_reply_times_out_dead() {
+        let addr = fake_socks(Vec::new());
+        assert!(socks_probe(&addr, TARGET, 53, SHORT).is_none());
+    }
+
+    #[test]
+    fn socks_probe_no_listener_is_dead() {
+        // 端口未监听（zju-connect 未起）→ 死
+        assert!(socks_probe("127.0.0.1:1", TARGET, 53, SHORT).is_none());
+    }
+
+    #[test]
+    fn socks_probe_garbage_reply_is_dead() {
+        let addr = fake_socks(vec![0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0]);
+        assert!(socks_probe(&addr, TARGET, 53, SHORT).is_none());
+    }
 }

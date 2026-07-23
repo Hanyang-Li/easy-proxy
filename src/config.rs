@@ -166,6 +166,9 @@ pub struct RuntimeState {
     pub http_upstream: String,
     pub server: String,
     pub tunnel_ip: String,
+    /// 服务端下发的 VPN DNS(穿隧道健康探针的目标);None = 探针降级为网关直连模式。
+    #[serde(default)]
+    pub vpn_dns: Option<String>,
     #[serde(default)]
     pub last_sms_sent: Option<u64>,
     #[serde(default)]
@@ -256,6 +259,7 @@ mod tests {
             http_upstream: "127.0.0.1:1081".into(),
             server: "vpn.example.com".into(),
             tunnel_ip: "10.0.0.1".into(),
+            vpn_dns: Some("10.0.104.104".into()),
             last_sms_sent: Some(1000),
             error: None,
         };
@@ -263,11 +267,13 @@ mod tests {
         let back: RuntimeState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.phase, Phase::Online);
         assert_eq!(back.last_sms_sent, Some(1000));
-        // 旧 0.2.x json(有 connected、无 phase/last_sms_sent)应能解析,新字段落默认
+        assert_eq!(back.vpn_dns.as_deref(), Some("10.0.104.104"));
+        // 旧 0.2.x json(有 connected、无 phase/last_sms_sent/vpn_dns)应能解析,新字段落默认
         let legacy = r#"{"connected":true,"daemon_pid":1,"port":7899,"socks_upstream":"a","http_upstream":"b","server":"s","tunnel_ip":"","error":null}"#;
         let parsed: RuntimeState = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.phase, Phase::Reconnecting);
         assert_eq!(parsed.last_sms_sent, None);
+        assert_eq!(parsed.vpn_dns, None);
     }
 
     #[test]
