@@ -474,10 +474,10 @@ fn cmd_start(paths: &Paths, cfg: &AppConfig) -> Result<()> {
 
 fn cmd_stop(cfg: &AppConfig) -> Result<()> {
     println!("unset http_proxy https_proxy all_proxy no_proxy");
-    let status = ProxyStatus { online: false, delay: Delay::Hidden, port: None };
+    // 不带状态胶囊:stop 只清当前终端的环境变量,daemon 仍在运行,显示 offline 会误导
     println!(
         "echo {}",
-        shell_single_quote(&success_line("命令行代理已关闭", Some(&status), &cfg.prompt))
+        shell_single_quote(&success_line("命令行代理已关闭", None, &cfg.prompt))
     );
     Ok(())
 }
