@@ -8,10 +8,12 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::copy_bidirectional;
+use tokio::io::{copy_bidirectional, AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::signal::unix::{signal, SignalKind};
+
+type RouteLines = tokio::io::Lines<BufReader<ChildStdout>>;
 
 #[derive(clap::Args, Clone)]
 pub struct ServeArgs {
@@ -140,10 +142,20 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     let mut fails: u32 = 0;
     let mut current_twfid = args.twfid.clone();
 
+    // 路由事件订阅:切网/唤醒秒级感知(事件→防抖→立即探测);不可用则只剩定时探测兜底。
+    let (mut route_child, mut route_lines) = match spawn_route_monitor() {
+        Some((c, l)) => (Some(c), Some(l)),
+        None => {
+            eprintln!("[daemon] route monitor 不可用,退化为纯定时探测");
+            (None, None)
+        }
+    };
+
     // select! 只产出「事件」,恢复动作在 select 外执行——避免与 child.wait() 的 &mut child 借用冲突。
     enum Ev {
         Continue,
         Probe,
+        NetChange,
         TunnelDown,
         Shutdown,
     }
@@ -163,6 +175,17 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
                 eprintln!("[daemon] zju-connect 退出: {status:?}，隧道断开");
                 Ev::TunnelDown
             }
+            line = next_route_line(&mut route_lines), if route_lines.is_some() => {
+                match line {
+                    Some(l) if is_route_event(&l) => Ev::NetChange,
+                    Some(_) => Ev::Continue,
+                    None => {
+                        route_lines = None;
+                        eprintln!("[daemon] route monitor 流结束,退化为纯定时探测");
+                        Ev::Continue
+                    }
+                }
+            }
             _ = tick.tick() => Ev::Probe,
             _ = notify.notified() => Ev::Shutdown,
         };
@@ -170,6 +193,23 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
         match ev {
             Ev::Continue => {}
             Ev::Shutdown => break,
+            Ev::NetChange => {
+                drain_route_events(&mut route_lines).await;
+                if probe(&args, state.vpn_dns.as_deref()).await {
+                    fails = 0; // 网络变化但隧道仍通(次要接口变动等),无事
+                } else {
+                    eprintln!("[daemon] 检测到网络变化且隧道不通,立即重连");
+                    if recover_or_exit(
+                        &mut child, &mut state, &cfg, paths, &args, &mut current_twfid, &shutdown,
+                    )
+                    .await
+                    {
+                        fails = 0;
+                    } else {
+                        break;
+                    }
+                }
+            }
             Ev::Probe => {
                 if probe(&args, state.vpn_dns.as_deref()).await {
                     fails = 0; // online:不打日志、不重写 state
@@ -203,6 +243,9 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
         }
     }
 
+    if let Some(c) = route_child.as_mut() {
+        let _ = c.start_kill();
+    }
     let _ = child.start_kill();
     let _ = child.wait().await;
     paths.clear_state();
@@ -301,6 +344,10 @@ async fn attempt_recover(
     current_twfid: &mut String,
     shutdown: &Arc<AtomicBool>,
 ) -> RecoverOutcome {
+    // 先等新网络就绪(直连网关可达):路由事件触发的恢复往往抢在 DHCP/关联完成之前,
+    // 不等就重启必失败,恢复流程会一路 GiveUp 把 daemon 拖下线。
+    wait_gateway_reachable(args, Duration::from_secs(30), shutdown).await;
+
     // step1: 旧 TWFID 重启(不吃闸门)
     if !shutdown.load(Ordering::Relaxed) {
         match restart_zju(child, paths, args, current_twfid).await {
@@ -420,6 +467,72 @@ async fn relay(client: TcpStream, socks: String, http: String) -> Result<()> {
     Ok(())
 }
 
+/// 订阅 macOS 路由事件流(`route -n monitor`):切网/插拔网线/唤醒都会立刻吐 RTM 消息,
+/// 让 daemon 秒级感知网络变化,不用干等健康检查节拍。普通用户可跑,无需 root。
+fn spawn_route_monitor() -> Option<(Child, RouteLines)> {
+    let mut child = Command::new("/sbin/route")
+        .args(["-n", "monitor"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    Some((child, BufReader::new(stdout).lines()))
+}
+
+/// route monitor 输出里只有消息类型行(RTM_*)算网络变化事件;
+/// 其余是 "got message of size ..." 头和字段 payload,忽略。
+fn is_route_event(line: &str) -> bool {
+    line.starts_with("RTM_")
+}
+
+/// 读下一行路由事件;None(流结束/未启用)由调用方处理降级。
+async fn next_route_line(lines: &mut Option<RouteLines>) -> Option<String> {
+    match lines {
+        Some(l) => l.next_line().await.ok().flatten(),
+        None => None, // select! 的 if 守卫保证不会走到
+    }
+}
+
+/// 防抖:切网会在几秒内连发一串路由消息,排空到连续 1.5s 无新事件为止,再让调用方动手探测。
+async fn drain_route_events(lines: &mut Option<RouteLines>) {
+    loop {
+        let Some(l) = lines.as_mut() else { return };
+        match tokio::time::timeout(Duration::from_millis(1500), l.next_line()).await {
+            Err(_) => return,                   // 1.5s 安静 → 抖动结束
+            Ok(Ok(Some(_))) => continue,        // 还在抖,继续排空
+            Ok(_) => {
+                *lines = None;                  // 流结束/IO 错误 → 降级为纯定时探测
+                return;
+            }
+        }
+    }
+}
+
+/// 等新网络就绪:直连 TCP 到网关:443 可达才值得重启隧道——切网后 DHCP/关联要几秒,
+/// 立刻重启必失败,恢复流程会一路 GiveUp 把 daemon 拖下线。最多等 budget,等不到照样往下试。
+async fn wait_gateway_reachable(args: &ServeArgs, budget: Duration, shutdown: &Arc<AtomicBool>) {
+    let deadline = Instant::now() + budget;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let ok = tokio::time::timeout(
+            Duration::from_secs(3),
+            TcpStream::connect((args.server.as_str(), args.https_port)),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+        if ok || Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 /// zju-connect 就绪信息：隧道虚拟 IP + 服务端下发的 VPN DNS（穿隧道探针的目标）。
 struct ReadyInfo {
     ip: String,
@@ -473,6 +586,19 @@ fn tail(paths: &Paths) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn route_event_lines_detected() {
+        // route -n monitor 的消息类型行才算事件
+        assert!(is_route_event("RTM_NEWADDR: address being added to iface: len 176"));
+        assert!(is_route_event("RTM_IFINFO: iface status change: len 168, if# 12"));
+        assert!(is_route_event("RTM_DELETE: Delete Route: len 172"));
+        // 消息头与 payload 行忽略
+        assert!(!is_route_event("got message of size 176 on Wed Jul 23 15:30:00 2026"));
+        assert!(!is_route_event(" locks:  inits: "));
+        assert!(!is_route_event("sockaddrs: <DST,GATEWAY,NETMASK>"));
+        assert!(!is_route_event(""));
+    }
 
     #[test]
     fn parse_vpn_dns_from_real_log() {

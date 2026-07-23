@@ -70,7 +70,7 @@ pub struct AppConfig {
     /// 「被服务端拒后重读」前的等待秒数：给正确的验证码送达 chat.db 的时间（不会重发短信）。默认 30。
     #[serde(default = "default_sms_retry_interval_secs")]
     pub sms_retry_interval_secs: u32,
-    /// 隧道健康检查周期(秒)。daemon 每隔这么久用延迟探针探一次连通性。
+    /// 隧道健康检查周期(秒)。切网/唤醒由路由事件秒级触发探测,此节拍只是兜底心跳。
     #[serde(default = "default_healthcheck_interval")]
     pub healthcheck_interval: u64,
     /// 连续探测失败几次判定断线(躲开单次抖动)。
@@ -94,7 +94,7 @@ fn default_sms_retry_interval_secs() -> u32 {
     30
 }
 fn default_healthcheck_interval() -> u64 {
-    15
+    60
 }
 fn default_healthcheck_fail_threshold() -> u32 {
     2
@@ -114,7 +114,7 @@ impl Default for AppConfig {
             sms_command: None,
             sms_retries: 1,
             sms_retry_interval_secs: 30,
-            healthcheck_interval: 15,
+            healthcheck_interval: 60,
             healthcheck_fail_threshold: 2,
             silent_relogin_interval: 3600,
         }
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn appconfig_defaults_present() {
         let c = AppConfig::default();
-        assert_eq!(c.healthcheck_interval, 15);
+        assert_eq!(c.healthcheck_interval, 60);
         assert_eq!(c.healthcheck_fail_threshold, 2);
         assert_eq!(c.silent_relogin_interval, 3600);
     }

@@ -90,7 +90,7 @@ port: 443
 username: "your-name@example.com"
 mixed_port: 7899          # 本机对外暴露的混合端口（避开 clash verge 的 7897 等）
 # sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"   # 可选：自动取码命令（见「自动获取短信验证码」）
-healthcheck_interval: 15         # 隧道健康检查周期（秒），daemon 每隔这么久探一次连通性
+healthcheck_interval: 60         # 兜底心跳（秒）：切网、唤醒由路由事件秒级触发探测，此周期只是兜底
 healthcheck_fail_threshold: 2    # 连续探测失败几次判定断线（躲开单次抖动）
 silent_relogin_interval: 3600    # 静默重登最小间隔（秒），按上次发码时刻限流下一次自动重登
 prompt:
@@ -119,9 +119,9 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 - 首条短信在 `login_psw`（密码通过）那一刻由服务端下发。需要新码时走 `post_sms.csp`（门户「重新发送验证码」同款接口，约 30s 重发间隔，新旧码各 5 分钟有效）；`login_sms.csp` 只查手机号配置、**不发短信**。
 - daemon 还会每 `healthcheck_interval` 探测一次连通性（详见下节）。
 
-## 断线自动恢复（0.3.0，探针 0.3.1 修正）
+## 断线自动恢复（0.3.0，探针 0.3.1 修正，路由事件 0.4.0）
 
-daemon 每 `healthcheck_interval`（默认 15s）探一次隧道连通性，连续 `healthcheck_fail_threshold`（默认 2）次失败判定断线，进入**分级恢复**。
+**切网秒级感知（0.4.0）**：daemon 订阅 macOS 路由事件流（`route -n monitor`），切 Wi-Fi / 插拔网线 / 唤醒时立即触发探测（1.5s 防抖），不通马上置 reconnecting 并重连——重连前先等新网络就绪（直连网关可达，最多 30s），避开 DHCP/关联窗口。定时探测退为兜底心跳：每 `healthcheck_interval`（默认 60s）探一次，连续 `healthcheck_fail_threshold`（默认 2）次失败进入**分级恢复**。
 
 探针**穿隧道探测**：SOCKS5 CONNECT 到服务端下发的 VPN DNS（如 `10.0.104.104:53`），TCP 握手必须穿过隧道往返，能测出「隧道假死」。0.3.0 曾探 `https://{server}/`，但网关地址被 zju-connect 路由为 DIRECT（直连不进隧道），切网后隧道已死探针仍绿、ssh 却超时。若日志里解析不到 VPN DNS、或新隧道上探不通 DNS:53（如 DNS 不答 TCP），自动降级回网关直连探测（行为同 0.3.0，只对「彻底断网」敏感）。`status` 的延迟数字同样穿隧道测（经混合端口），不再显示假延迟。
 
