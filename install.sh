@@ -38,10 +38,12 @@ tar -xzf "$tmp/$BIN.tar.gz" -C "$tmp"
 chmod +x "$tmp/$BIN"
 
 mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+# 先 cp 到同目录临时名再 mv（rename 换新 inode）：直接 cp 原地覆盖正在运行的旧二进制会
+# 命中 macOS AMFI 签名缓存（同 inode 内容变了指纹不认），之后每次执行都被 Killed: 9
 if [ -w "$INSTALL_DIR" ]; then
-  cp "$tmp/$BIN" "$INSTALL_DIR/$BIN"
+  cp "$tmp/$BIN" "$INSTALL_DIR/$BIN.new" && mv -f "$INSTALL_DIR/$BIN.new" "$INSTALL_DIR/$BIN"
 else
-  sudo cp "$tmp/$BIN" "$INSTALL_DIR/$BIN"
+  sudo cp "$tmp/$BIN" "$INSTALL_DIR/$BIN.new" && sudo mv -f "$INSTALL_DIR/$BIN.new" "$INSTALL_DIR/$BIN"
 fi
 info "已安装 $BIN $tag 到 $INSTALL_DIR/$BIN"
 
