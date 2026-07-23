@@ -459,7 +459,22 @@ fn connected_state(paths: &Paths) -> Option<config::RuntimeState> {
         .filter(|s| s.phase == config::Phase::Online && tunnel::pid_alive(s.daemon_pid))
 }
 
+/// proxy_name 被设为非 easy 的其他非空值时,说明当前终端已被别的代理工具接管,
+/// easy-proxy 不应干预,返回该占用值。不存在、为空、或等于 easy 时返回 None(允许操作)。
+fn foreign_proxy_name() -> Option<String> {
+    let val = std::env::var_os("proxy_name")?;
+    match val.to_str() {
+        Some("") | Some("easy") => None,
+        Some(other) => Some(other.to_string()),
+        None => Some("<非文本值>".to_string()),
+    }
+}
+
 fn cmd_start(paths: &Paths, cfg: &AppConfig) -> Result<()> {
+    if let Some(name) = foreign_proxy_name() {
+        emit_shell_error(&format!("proxy_name 当前为 {name}，非 easy，拒绝操作"), cfg);
+        return Ok(());
+    }
     let Some(st) = connected_state(paths) else {
         emit_shell_error("未连接，请先执行 easy-proxy connect", cfg);
         return Ok(());
@@ -476,6 +491,10 @@ fn cmd_start(paths: &Paths, cfg: &AppConfig) -> Result<()> {
 }
 
 fn cmd_stop(cfg: &AppConfig) -> Result<()> {
+    if let Some(name) = foreign_proxy_name() {
+        emit_shell_error(&format!("proxy_name 当前为 {name}，非 easy，拒绝操作"), cfg);
+        return Ok(());
+    }
     println!("unset http_proxy https_proxy all_proxy no_proxy CORP_PROXY proxy_name");
     // 不带状态胶囊:stop 只清当前终端的环境变量,daemon 仍在运行,显示 offline 会误导
     println!(
@@ -486,6 +505,10 @@ fn cmd_stop(cfg: &AppConfig) -> Result<()> {
 }
 
 fn cmd_restart(paths: &Paths, cfg: &AppConfig) -> Result<()> {
+    if let Some(name) = foreign_proxy_name() {
+        emit_shell_error(&format!("proxy_name 当前为 {name}，非 easy，拒绝操作"), cfg);
+        return Ok(());
+    }
     let Some(st) = connected_state(paths) else {
         emit_shell_error("未连接，请先执行 easy-proxy connect", cfg);
         return Ok(());
