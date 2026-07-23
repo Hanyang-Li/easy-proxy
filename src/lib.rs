@@ -363,9 +363,16 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     if let Some(st) = paths.read_state() {
         if tunnel::pid_alive(st.daemon_pid) {
             if st.phase == config::Phase::Online {
-                let delay = tunnel::probe_state_latency(&st);
-                let status = ProxyStatus { state: ConnState::Online, delay, port: Some(st.port) };
-                println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
+                let status = runtime_capsule(&st);
+                if status.state == ConnState::Online {
+                    println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
+                } else {
+                    // phase=Online 但实测隧道不通:看门狗将自动恢复,不由本次 connect 接管(省一次短信)
+                    println!(
+                        "{}",
+                        info_line("隧道恢复中(看门狗将自动重连)", Some(&status), &cfg.prompt)
+                    );
+                }
                 return Ok(());
             }
             eprintln!(
@@ -427,13 +434,9 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     let line = StatusLine::new();
     line.progress("  连接中…");
     let ready = tunnel::wait_ready(paths, std::time::Duration::from_secs(45))
-        .map(|st| {
-            let delay = tunnel::probe_state_latency(&st);
-            (st, delay)
-        });
+        .map(|st| runtime_capsule(&st));
     line.clear(); // 无论成功失败，先清掉进度行，别让后续输出黏在「连接中…」后面
-    let (st, delay) = ready?;
-    let status = ProxyStatus { state: ConnState::Online, delay, port: Some(st.port) };
+    let status = ready?;
     println!("{}", success_line("已连接", Some(&status), &cfg.prompt));
     Ok(())
 }
@@ -512,21 +515,41 @@ fn emit_shell_error(message: &str, cfg: &AppConfig) {
 }
 
 fn cmd_status(paths: &Paths, cfg: &AppConfig) -> Result<()> {
-    // 三态:online(探延迟) / reconnecting(daemon 活着、后台重连中,不探——隧道正在重建) / offline
+    // 三态:online(探针通,带延迟) / reconnecting(phase 已是重连、或 phase=Online 但实测不通) / offline
     let status = match paths.read_state().filter(|s| tunnel::pid_alive(s.daemon_pid)) {
-        Some(st) if st.phase == config::Phase::Online => {
-            let delay = tunnel::probe_state_latency(&st);
-            ProxyStatus { state: ConnState::Online, delay, port: Some(st.port) }
-        }
-        Some(st) => ProxyStatus {
-            state: ConnState::Reconnecting,
-            delay: Delay::Hidden,
-            port: Some(st.port),
-        },
+        Some(st) => runtime_capsule(&st),
         None => ProxyStatus { state: ConnState::Offline, delay: Delay::Hidden, port: None },
     };
     println!("{}", format_capsule(&status, &cfg.prompt, terminal_width(), 0));
     Ok(())
+}
+
+/// 胶囊显示决策(纯函数):phase=Online 且探针通 → online+延迟;phase=Online 但探针不通 →
+/// reconnecting(看门狗还没攒够失败阈值,抢先如实反映「不可用但会自愈」,不显示延迟段);
+/// phase=Reconnecting → reconnecting。reconnecting 一律隐藏延迟段、保留端口段。
+fn capsule_from(phase: config::Phase, probe: Delay, port: u16) -> ProxyStatus {
+    match (phase, probe) {
+        (config::Phase::Online, Delay::Timeout) | (config::Phase::Reconnecting, _) => ProxyStatus {
+            state: ConnState::Reconnecting,
+            delay: Delay::Hidden,
+            port: Some(port),
+        },
+        (config::Phase::Online, delay) => ProxyStatus {
+            state: ConnState::Online,
+            delay,
+            port: Some(port),
+        },
+    }
+}
+
+/// 依据运行时状态合成胶囊:Online 才实测探针(单次快速),Reconnecting 直接出黄胶囊、零等待。
+fn runtime_capsule(st: &config::RuntimeState) -> ProxyStatus {
+    let probe = if st.phase == config::Phase::Online {
+        tunnel::probe_state_latency(st)
+    } else {
+        Delay::Hidden
+    };
+    capsule_from(st.phase, probe, st.port)
 }
 
 fn cmd_port(paths: &Paths, cfg: &AppConfig, connected_only: bool) -> Result<()> {
@@ -540,6 +563,35 @@ fn cmd_port(paths: &Paths, cfg: &AppConfig, connected_only: bool) -> Result<()> 
             println!("{}", cfg.mixed_port);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capsule_online_with_probe_alive_shows_delay() {
+        let c = capsule_from(config::Phase::Online, Delay::Value(42), 7899);
+        assert_eq!(c.state, ConnState::Online);
+        assert_eq!(c.delay, Delay::Value(42));
+        assert_eq!(c.port, Some(7899));
+    }
+
+    #[test]
+    fn capsule_online_but_probe_dead_shows_reconnecting_without_delay() {
+        // 切网后、看门狗未达阈值:phase 仍 Online 但探针 timeout → 黄胶囊,无延迟段
+        let c = capsule_from(config::Phase::Online, Delay::Timeout, 7899);
+        assert_eq!(c.state, ConnState::Reconnecting);
+        assert_eq!(c.delay, Delay::Hidden);
+        assert_eq!(c.port, Some(7899));
+    }
+
+    #[test]
+    fn capsule_reconnecting_phase_never_shows_delay() {
+        let c = capsule_from(config::Phase::Reconnecting, Delay::Value(10), 7899);
+        assert_eq!(c.state, ConnState::Reconnecting);
+        assert_eq!(c.delay, Delay::Hidden);
     }
 }
 

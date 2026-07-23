@@ -109,16 +109,16 @@ pub fn probe_latency(port: u16, server: &str) -> Delay {
 
 /// 面向 CLI(status/connect)的延迟探测:state 带 vpn_dns → SOCKS5 穿隧道探测
 /// (经 mixed_port,首字节 0x05 会被 relay 到 socks 上游,顺带验证转发层);
-/// 否则回退 curl 直连网关(旧行为,对隧道假死不敏感)。预算 3s×2 次,与旧探针一致。
+/// 否则回退 curl 直连网关(旧行为,对隧道假死不敏感)。
+/// 单次 1.5s:交互命令要快——健康隧道的 SOCKS 往返远小于此,判死则立即出黄胶囊,
+/// 不为重试多等;偶发误判下一次 status 自然纠正。daemon 侧看门狗仍是 3s×2(稳定优先)。
 pub fn probe_state_latency(st: &RuntimeState) -> Delay {
     if let Some(ip) = st.vpn_dns.as_deref().and_then(|d| d.parse().ok()) {
         let mixed = format!("127.0.0.1:{}", st.port);
-        for _ in 0..2 {
-            if let Some(d) = socks_probe(&mixed, ip, 53, Duration::from_secs(3)) {
-                return Delay::Value((d.as_millis() as u64).max(1));
-            }
-        }
-        return Delay::Timeout;
+        return match socks_probe(&mixed, ip, 53, Duration::from_millis(1500)) {
+            Some(d) => Delay::Value((d.as_millis() as u64).max(1)),
+            None => Delay::Timeout,
+        };
     }
     probe_latency(st.port, &st.server)
 }
