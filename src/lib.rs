@@ -476,7 +476,7 @@ fn cmd_start(paths: &Paths, cfg: &AppConfig) -> Result<()> {
 }
 
 fn cmd_stop(cfg: &AppConfig) -> Result<()> {
-    println!("unset http_proxy https_proxy all_proxy no_proxy");
+    println!("unset http_proxy https_proxy all_proxy no_proxy CORP_PROXY proxy_name");
     // 不带状态胶囊:stop 只清当前终端的环境变量,daemon 仍在运行,显示 offline 会误导
     println!(
         "echo {}",
@@ -499,6 +499,8 @@ fn emit_exports(port: u16, cfg: &AppConfig, message: &str) {
     println!("export https_proxy=http://127.0.0.1:{port}");
     println!("export all_proxy=socks5://127.0.0.1:{port}");
     println!("export no_proxy=localhost,127.0.0.1");
+    println!("export CORP_PROXY=http://127.0.0.1:{port}");
+    println!("export proxy_name=easy");
     let status = ProxyStatus { state: ConnState::Online, delay: Delay::Hidden, port: Some(port) };
     println!(
         "echo {}",
