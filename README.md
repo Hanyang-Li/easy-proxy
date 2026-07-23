@@ -129,7 +129,7 @@ daemon 每 `healthcheck_interval`（默认 15s）探一次隧道连通性，连�
 2. 仍不通且**配了 `sms_command`** 时，才**静默重新登录**（钥匙串密码 + 自动取码）。此步受 `silent_relogin_interval`（默认 3600s）限流：按**上次发码时刻**算（手动 connect、补发、静默重登的发码都算），距上次发码不足该间隔就不再自动重登，直接转 offline。
 3. 恢复彻底失败（旧 TWFID 失效 + 被限流 / 取不到码 / 未配 `sms_command`）→ daemon 退出、`status` 显示 offline，等你手动 `connect`。
 
-**状态**：`online`（探测通） / 后台重连中（对外仍显示 offline） / `offline`（无守护）。合盖休眠时进程被系统挂起、不占资源，唤醒后立即补探一次。
+**状态**：`online`（探测通） / `reconnecting`（daemon 活着、后台重连中，胶囊黄色） / `offline`（无守护）。合盖休眠时进程被系统挂起、不占资源，唤醒后立即补探一次。
 
 **手动 `connect` 不受限流**；若后台正在重连，手动 `connect` 会**接管**——停掉后台守护，由前台（有 tty）完整走登录（向手机发码、自动 / 手动取码），与平常 connect 完全一致。
 

@@ -11,6 +11,7 @@ pub const ANSI_BOLD_GREEN: &str = "\x1b[1;38;2;166;227;161m";
 pub const ANSI_BOLD_RED: &str = "\x1b[1;38;2;243;139;168m";
 
 const COLOR_ONLINE: &str = "#a6e3a1";
+const COLOR_RECONNECTING: &str = "#f8dea6";
 const COLOR_OFFLINE: &str = "#6c7086";
 const COLOR_DELAY: &str = "#74c7ec";
 const COLOR_PORT: &str = "#b4befe";
@@ -24,9 +25,17 @@ pub enum Delay {
     Timeout,
 }
 
+/// 连接状态(胶囊第一段):online / reconnecting(daemon 活着、后台重连中) / offline。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnState {
+    Online,
+    Reconnecting,
+    Offline,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyStatus {
-    pub online: bool,
+    pub state: ConnState,
     pub delay: Delay,
     pub port: Option<u16>,
 }
@@ -67,18 +76,29 @@ impl Segment {
 
 fn segments(status: &ProxyStatus, prompt: &PromptConfig) -> Vec<Segment> {
     let mut out = Vec::with_capacity(3);
-    if status.online {
-        out.push(Segment::new(prompt.online(), "online".to_string(), COLOR_ONLINE));
-        match status.delay {
-            Delay::Hidden => {}
-            Delay::Value(ms) => out.push(Segment::new(prompt.delay(), format!("{ms}ms"), COLOR_DELAY)),
-            Delay::Timeout => out.push(Segment::new(prompt.delay(), "timeout".to_string(), COLOR_DELAY)),
+    match status.state {
+        ConnState::Offline => {
+            out.push(Segment::new(prompt.offline(), "offline".to_string(), COLOR_OFFLINE));
+            return out;
         }
-        if let Some(port) = status.port {
-            out.push(Segment::new(prompt.port(), port.to_string(), COLOR_PORT));
+        ConnState::Online => {
+            out.push(Segment::new(prompt.online(), "online".to_string(), COLOR_ONLINE));
         }
-    } else {
-        out.push(Segment::new(prompt.offline(), "offline".to_string(), COLOR_OFFLINE));
+        ConnState::Reconnecting => {
+            out.push(Segment::new(
+                prompt.reconnecting(),
+                "reconnecting".to_string(),
+                COLOR_RECONNECTING,
+            ));
+        }
+    }
+    match status.delay {
+        Delay::Hidden => {}
+        Delay::Value(ms) => out.push(Segment::new(prompt.delay(), format!("{ms}ms"), COLOR_DELAY)),
+        Delay::Timeout => out.push(Segment::new(prompt.delay(), "timeout".to_string(), COLOR_DELAY)),
+    }
+    if let Some(port) = status.port {
+        out.push(Segment::new(prompt.port(), port.to_string(), COLOR_PORT));
     }
     out
 }
@@ -290,5 +310,38 @@ mod tests {
     fn info_line_reserves_logo_slot() {
         let p = PromptConfig::default();
         assert_eq!(info_line("连接中…", None, &p), "  连接中…");
+    }
+
+    #[test]
+    fn reconnecting_state_renders_yellow_first_segment() {
+        let p = PromptConfig::default();
+        let st = ProxyStatus {
+            state: ConnState::Reconnecting,
+            delay: Delay::Hidden,
+            port: Some(7899),
+        };
+        let segs = segments(&st, &p);
+        assert_eq!(segs[0].value, "reconnecting");
+        assert_eq!(segs[0].color, "#f8dea6");
+        // 端口段保留(daemon 还活着),延迟段隐藏
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[1].value, "7899");
+    }
+
+    #[test]
+    fn online_and_offline_states_unchanged() {
+        let p = PromptConfig::default();
+        let on = segments(
+            &ProxyStatus { state: ConnState::Online, delay: Delay::Value(42), port: Some(7899) },
+            &p,
+        );
+        assert_eq!(on[0].value, "online");
+        assert_eq!(on.len(), 3);
+        let off = segments(
+            &ProxyStatus { state: ConnState::Offline, delay: Delay::Hidden, port: None },
+            &p,
+        );
+        assert_eq!(off[0].value, "offline");
+        assert_eq!(off.len(), 1);
     }
 }

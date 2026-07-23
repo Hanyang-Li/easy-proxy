@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct PromptConfig {
     pub online_icon: Option<String>,
     pub offline_icon: Option<String>,
+    pub reconnecting_icon: Option<String>,
     pub delay_icon: Option<String>,
     pub port_icon: Option<String>,
 }
@@ -19,6 +20,7 @@ impl Default for PromptConfig {
         Self {
             online_icon: Some("󰌘".to_string()),   // link
             offline_icon: Some("󰌙".to_string()),  // link-off
+            reconnecting_icon: Some("󰑐".to_string()), // refresh
             delay_icon: Some("󱎫".to_string()),    // 与 verge-proxy 对齐
             port_icon: Some("󰤨".to_string()),     // 与 verge-proxy 对齐
         }
@@ -31,6 +33,9 @@ impl PromptConfig {
     }
     pub fn offline(&self) -> &str {
         self.offline_icon.as_deref().unwrap_or("󰌙")
+    }
+    pub fn reconnecting(&self) -> &str {
+        self.reconnecting_icon.as_deref().unwrap_or("󰑐")
     }
     pub fn delay(&self) -> &str {
         self.delay_icon.as_deref().unwrap_or("󱎫")

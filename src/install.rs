@@ -122,6 +122,7 @@ mixed_port: 7899
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"
+  reconnecting_icon: "󰑐"
   delay_icon: "󱎫"
   port_icon: "󰤨"
 "#

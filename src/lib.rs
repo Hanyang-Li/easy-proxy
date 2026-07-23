@@ -14,8 +14,8 @@ mod sms;
 mod tunnel;
 
 use capsule::{
-    error_line, format_capsule, info_line, shell_single_quote, success_line, terminal_width, Delay,
-    ProxyStatus,
+    error_line, format_capsule, info_line, shell_single_quote, success_line, terminal_width,
+    ConnState, Delay, ProxyStatus,
 };
 use config::{AppConfig, Paths};
 
@@ -364,7 +364,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
         if tunnel::pid_alive(st.daemon_pid) {
             if st.phase == config::Phase::Online {
                 let delay = tunnel::probe_state_latency(&st);
-                let status = ProxyStatus { online: true, delay, port: Some(st.port) };
+                let status = ProxyStatus { state: ConnState::Online, delay, port: Some(st.port) };
                 println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
                 return Ok(());
             }
@@ -433,7 +433,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
         });
     line.clear(); // 无论成功失败，先清掉进度行，别让后续输出黏在「连接中…」后面
     let (st, delay) = ready?;
-    let status = ProxyStatus { online: true, delay, port: Some(st.port) };
+    let status = ProxyStatus { state: ConnState::Online, delay, port: Some(st.port) };
     println!("{}", success_line("已连接", Some(&status), &cfg.prompt));
     Ok(())
 }
@@ -442,7 +442,7 @@ fn cmd_disconnect(paths: &Paths, cfg: &AppConfig) -> Result<()> {
     tunnel::stop_daemon(paths);
     // 供 zsh wrapper eval：清掉当前终端代理环境变量
     println!("unset http_proxy https_proxy all_proxy no_proxy");
-    let status = ProxyStatus { online: false, delay: Delay::Hidden, port: None };
+    let status = ProxyStatus { state: ConnState::Offline, delay: Delay::Hidden, port: None };
     println!(
         "echo {}",
         shell_single_quote(&success_line("已断开", Some(&status), &cfg.prompt))
@@ -496,7 +496,7 @@ fn emit_exports(port: u16, cfg: &AppConfig, message: &str) {
     println!("export https_proxy=http://127.0.0.1:{port}");
     println!("export all_proxy=socks5://127.0.0.1:{port}");
     println!("export no_proxy=localhost,127.0.0.1");
-    let status = ProxyStatus { online: true, delay: Delay::Hidden, port: Some(port) };
+    let status = ProxyStatus { state: ConnState::Online, delay: Delay::Hidden, port: Some(port) };
     println!(
         "echo {}",
         shell_single_quote(&success_line(message, Some(&status), &cfg.prompt))
@@ -512,12 +512,18 @@ fn emit_shell_error(message: &str, cfg: &AppConfig) {
 }
 
 fn cmd_status(paths: &Paths, cfg: &AppConfig) -> Result<()> {
-    let status = match connected_state(paths) {
-        Some(st) => {
+    // 三态:online(探延迟) / reconnecting(daemon 活着、后台重连中,不探——隧道正在重建) / offline
+    let status = match paths.read_state().filter(|s| tunnel::pid_alive(s.daemon_pid)) {
+        Some(st) if st.phase == config::Phase::Online => {
             let delay = tunnel::probe_state_latency(&st);
-            ProxyStatus { online: true, delay, port: Some(st.port) }
+            ProxyStatus { state: ConnState::Online, delay, port: Some(st.port) }
         }
-        None => ProxyStatus { online: false, delay: Delay::Hidden, port: None },
+        Some(st) => ProxyStatus {
+            state: ConnState::Reconnecting,
+            delay: Delay::Hidden,
+            port: Some(st.port),
+        },
+        None => ProxyStatus { state: ConnState::Offline, delay: Delay::Hidden, port: None },
     };
     println!("{}", format_capsule(&status, &cfg.prompt, terminal_width(), 0));
     Ok(())
