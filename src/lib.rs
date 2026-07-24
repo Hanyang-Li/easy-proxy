@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 mod capsule;
 mod config;
@@ -86,6 +88,77 @@ pub fn run() -> Result<()> {
 /// 顶层错误输出(供 main 使用):红叉 + 消息,无胶囊,不依赖具体配置。
 pub fn top_error(message: &str) -> String {
     capsule::error_line(message, None, &config::PromptConfig::default())
+}
+
+/// 进度 spinner 帧(与参考项目 fintopia-jump 同款盲文动画,单字宽,与 ✔/✘ 对齐)。
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn spinner_frame(i: usize) -> &'static str {
+    SPINNER_FRAMES[i % SPINNER_FRAMES.len()]
+}
+
+/// SIGINT 前快照到的「干净(cooked)终端属性」。任何 raw 阶段(EscGuard / dialoguer)被 Ctrl-C
+/// 打断时,由信号线程据此把终端恢复原状,避免残留无回显 / 无行编辑。
+static ORIG_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+/// 安装 Ctrl-C 处理:先快照当前(此刻仍是 cooked)终端属性,再起一条独立线程等待 SIGINT——
+/// 收到即恢复终端、换行、以 130 退出。放在独立线程(而非信号上下文)里做,故可安全 tcsetattr / 加锁,
+/// spinner 后台线程与之互不阻塞,Ctrl-C 全程可即时干净退出。
+fn install_sigint_handler() {
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        if libc::isatty(fd) == 1 {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) == 0 {
+                if let Ok(mut g) = ORIG_TERMIOS.lock() {
+                    *g = Some(t);
+                }
+            }
+        }
+    }
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([signal_hook::consts::SIGINT]) {
+        thread::spawn(move || {
+            // 等第一个 SIGINT 即恢复终端并退出;后续无需理会(进程随即终止)。
+            if signals.forever().next().is_some() {
+                if let Ok(g) = ORIG_TERMIOS.lock() {
+                    if let Some(t) = g.as_ref() {
+                        unsafe {
+                            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
+                        }
+                    }
+                }
+                let _ = writeln!(std::io::stderr()); // 从 spinner / 提示行挪到新行
+                std::process::exit(130);
+            }
+        });
+    }
+}
+
+/// 交互输入主题:把左侧 logo 换成本项目的加粗蓝 `›`(与 spinner 同蓝、与 ✔/✘ 同宽同风格),
+/// 冒号后缀承接参考项目 `› 标签: ` 的观感;成功/错误前缀沿用 dialoguer 的绿 ✔ / 红 ✘。
+fn ep_theme() -> dialoguer::theme::ColorfulTheme {
+    use dialoguer::console::style;
+    dialoguer::theme::ColorfulTheme {
+        prompt_prefix: style("›".to_string())
+            .for_stderr()
+            .true_color(137, 180, 250)
+            .bold(),
+        prompt_suffix: style(":".to_string()).for_stderr().black().bright(),
+        ..dialoguer::theme::ColorfulTheme::default()
+    }
+}
+
+/// Ctrl-C 落在 dialoguer 输入上时(其读取期间 ISIG 关闭,不产生信号)会返回 Interrupted;
+/// 这里统一映射成「干净退出 130」,与 raw / spinner 阶段的 Ctrl-C 行为一致。
+fn prompt_or_exit<T>(r: dialoguer::Result<T>) -> Result<T> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(dialoguer::Error::IO(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+            eprintln!();
+            std::process::exit(130);
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// 自动化：轮询文件读取验证码（最多 180s），供脚本/无 tty 场景。
@@ -183,29 +256,85 @@ fn sleep_cancelable(dur: std::time::Duration, esc: Option<&EscGuard>) -> bool {
     }
 }
 
-/// 单行原地刷新器：tty 上用 `\r\x1b[2K` 覆盖上一次内容（进度行不换行、结果行换行定格）；
-/// 非 tty 退化为逐行打印（每个状态各占一行，便于日志留痕）。
+/// 单行原地刷新器 + 后台蓝色 spinner:
+/// tty 上 `progress` 会拉起一条独立动画线程(固定 ~80ms 一帧),即便主线程正卡在取码 / 等待里,
+/// spinner 也照转不误、绝不冻结;`finish` 停转并定格结果行,`clear` 停转并擦除。
+/// 非 tty 退化为逐行打印(每个状态各占一行、便于日志留痕,且不含控制字节 / spinner 刷屏)。
 struct StatusLine {
     tty: bool,
+    state: Arc<Mutex<SpinnerState>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct SpinnerState {
+    msg: String,
+    done: bool,
 }
 
 impl StatusLine {
     fn new() -> Self {
-        StatusLine { tty: std::io::stderr().is_terminal() }
-    }
-
-    /// 刷成一条「进行中」的行：tty 上覆盖并停在行尾（等待被后续内容替换）。
-    fn progress(&self, text: &str) {
-        if self.tty {
-            eprint!("\r\x1b[2K{text}");
-            let _ = std::io::stderr().flush();
-        } else {
-            eprintln!("{text}");
+        StatusLine {
+            tty: std::io::stderr().is_terminal(),
+            state: Arc::new(Mutex::new(SpinnerState { msg: String::new(), done: false })),
+            handle: Mutex::new(None),
         }
     }
 
-    /// 定格一条最终结果行：覆盖掉进行中的行并换行。
+    /// 刷成一条「进行中」的行:tty 上首次调用拉起后台 spinner 线程、其后仅更新文案(线程自转);
+    /// 非 tty 逐行打印。spinner 字形取加粗蓝、文案留默认色,前缀与 ✔/✘ 同宽对齐。
+    fn progress(&self, text: &str) {
+        if !self.tty {
+            eprintln!("{text}");
+            return;
+        }
+        {
+            let mut s = self.state.lock().unwrap();
+            s.msg = text.trim_start().to_string(); // 去掉旧的两空格 logo 位,交给 spinner 字形占位
+            s.done = false;
+        }
+        let mut h = self.handle.lock().unwrap();
+        if h.is_none() {
+            let shared = self.state.clone();
+            *h = Some(thread::spawn(move || {
+                let mut frame = 0usize;
+                loop {
+                    {
+                        let s = shared.lock().unwrap();
+                        if s.done {
+                            break;
+                        }
+                        let mut e = std::io::stderr();
+                        let _ = write!(
+                            e,
+                            "\r\x1b[2K{}{}{} {}",
+                            capsule::ANSI_BOLD_BLUE,
+                            spinner_frame(frame),
+                            capsule::ANSI_RESET,
+                            s.msg
+                        );
+                        let _ = e.flush();
+                    }
+                    frame += 1;
+                    thread::sleep(std::time::Duration::from_millis(80));
+                }
+            }));
+        }
+    }
+
+    /// 停转后台 spinner 并等它退出(未启动则无操作)。
+    fn stop(&self) {
+        {
+            let mut s = self.state.lock().unwrap();
+            s.done = true;
+        }
+        if let Some(h) = self.handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    }
+
+    /// 定格一条最终结果行:停转 spinner,覆盖掉进行中的行并换行。
     fn finish(&self, text: &str) {
+        self.stop();
         if self.tty {
             eprintln!("\r\x1b[2K{text}");
         } else {
@@ -213,13 +342,20 @@ impl StatusLine {
         }
     }
 
-    /// 只清掉进行中的行、不打印新内容（tty）；非 tty 无操作。
-    /// 用于「结果行走 stdout」的场景：先清 stderr 进度行，再由调用方 println 结果。
+    /// 只擦掉进行中的行、不打印新内容(tty):先停转 spinner 再清行,供「结果行走 stdout」场景。
     fn clear(&self) {
+        self.stop();
         if self.tty {
             eprint!("\r\x1b[2K");
             let _ = std::io::stderr().flush();
         }
+    }
+}
+
+impl Drop for StatusLine {
+    fn drop(&mut self) {
+        // 漏调 finish/clear(如错误向上传播)时,确保后台线程停下,别在后续输出上继续刷屏。
+        self.stop();
     }
 }
 
@@ -303,17 +439,22 @@ impl sms::SmsUi for TtyUi {
 /// 手动输入验证码并提交，最多 3 次（格式错误由 dialoguer 当场拦下、不计入）。全错则抛错。
 fn manual_phase(cfg: &AppConfig, jar: &Path) -> Result<String> {
     const MANUAL_ATTEMPTS: u32 = 3;
+    let theme = ep_theme();
     for attempt in 1..=MANUAL_ATTEMPTS {
-        let code: String = dialoguer::Input::new()
-            .with_prompt("短信验证码")
-            .validate_with(|s: &String| -> Result<(), &str> {
-                if s.trim().chars().all(|c| c.is_ascii_digit()) && (4..=8).contains(&s.trim().len()) {
-                    Ok(())
-                } else {
-                    Err("应为 4-8 位数字")
-                }
-            })
-            .interact_text()?;
+        let code: String = prompt_or_exit(
+            dialoguer::Input::with_theme(&theme)
+                .with_prompt("短信验证码")
+                .validate_with(|s: &String| -> Result<(), &str> {
+                    if s.trim().chars().all(|c| c.is_ascii_digit())
+                        && (4..=8).contains(&s.trim().len())
+                    {
+                        Ok(())
+                    } else {
+                        Err("应为 4-8 位数字")
+                    }
+                })
+                .interact_text(),
+        )?;
         match login::submit_sms(&cfg.server, cfg.port, jar, code.trim())? {
             login::SmsOutcome::Accepted(twfid) => return Ok(twfid),
             login::SmsOutcome::Rejected(why) => eprintln!(
@@ -352,6 +493,8 @@ fn automation_via_file(cfg: &AppConfig, jar: &Path, path: &str) -> Result<String
 }
 
 fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
+    // 进入交互(密码 / 取码含 raw 模式)前装好 Ctrl-C 处理:全程可即时干净退出、不残留终端状态。
+    install_sigint_handler();
     if cfg.server.trim().is_empty() || cfg.username.trim().is_empty() {
         return Err(anyhow!(
             "请先编辑 {} 填入 server 和 username",
@@ -403,9 +546,11 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
         let (pwd, from_user) = match password.take() {
             Some(p) => (p, false),
             None => {
-                let p = dialoguer::Password::new()
-                    .with_prompt(format!("VPN 密码（{}）", cfg.username))
-                    .interact()?;
+                let p = prompt_or_exit(
+                    dialoguer::Password::with_theme(&ep_theme())
+                        .with_prompt(format!("VPN 密码（{}）", cfg.username))
+                        .interact(),
+                )?;
                 (p, true)
             }
         };
@@ -594,6 +739,24 @@ fn cmd_port(paths: &Paths, cfg: &AppConfig, connected_only: bool) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_frame_cycles() {
+        assert_eq!(spinner_frame(0), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(10), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(11), SPINNER_FRAMES[1]);
+    }
+
+    #[test]
+    fn progress_logo_aligns_with_result_markers() {
+        // spinner 字形与输入 logo `›` 必须与 ✔/✘ 同宽(单字宽 + 空格 = 2 列),保证左边缘对齐。
+        for f in SPINNER_FRAMES {
+            assert_eq!(capsule::display_width(&format!("{f} ")), 2, "帧 {f} 不是单字宽");
+        }
+        assert_eq!(capsule::display_width("› "), 2);
+        assert_eq!(capsule::display_width("✔ "), 2);
+        assert_eq!(capsule::display_width("✘ "), 2);
+    }
 
     #[test]
     fn capsule_online_with_probe_alive_shows_delay() {

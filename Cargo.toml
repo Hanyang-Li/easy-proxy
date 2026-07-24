@@ -1,6 +1,6 @@
 [package]
 name = "easy-proxy"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 
 [dependencies]
@@ -16,6 +16,7 @@ rsa = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+signal-hook = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "process", "sync"] }
 unicode-width = "0.2"
 

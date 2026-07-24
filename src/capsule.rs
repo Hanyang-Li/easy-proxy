@@ -9,6 +9,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub const ANSI_RESET: &str = "\x1b[0m";
 pub const ANSI_BOLD_GREEN: &str = "\x1b[1;38;2;166;227;161m";
 pub const ANSI_BOLD_RED: &str = "\x1b[1;38;2;243;139;168m";
+/// 进行中 spinner 字形 / 输入提示 logo 用的加粗蓝(#89b4fa),与 ✔/✘ 同风格同宽。
+pub const ANSI_BOLD_BLUE: &str = "\x1b[1;38;2;137;180;250m";
 
 const COLOR_ONLINE: &str = "#a6e3a1";
 const COLOR_RECONNECTING: &str = "#f8dea6";
