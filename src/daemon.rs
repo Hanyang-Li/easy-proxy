@@ -391,7 +391,9 @@ async fn attempt_recover(
     }
 
     let cfg2 = cfg.clone();
-    let jar = paths.cookies.clone();
+    // 静默重登用缓存目录里的一次性 jar，不碰前台 connect 的 cookies
+    let _ = std::fs::create_dir_all(&paths.cache_dir);
+    let jar = paths.silent_cookies.clone();
     let sd = shutdown.clone();
     let sent = Arc::new(AtomicU64::new(0));
     let sent2 = sent.clone();

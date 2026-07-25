@@ -1,8 +1,11 @@
 //! install：释放内嵌 zju-connect、写默认配置 / zsh 补全 / .zshrc 托管块。
+//!
+//! 落盘位置见 [`crate::config::Paths`]：配置 ~/.config/easy-proxy、数据 ~/.local/share/easy-proxy、
+//! 补全软链 ~/.local/share/zsh/site-functions，全在 $HOME 下，不需要 sudo。
 
 use crate::capsule::success_line;
 use crate::config::{Paths, PromptConfig};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -35,9 +38,9 @@ impl Action {
 pub fn cmd_install(paths: &Paths) -> Result<()> {
     fs::create_dir_all(&paths.config_dir)
         .with_context(|| format!("无法创建 {}", paths.config_dir.display()))?;
-    fs::create_dir_all(&paths.completions_dir)?;
-    fs::create_dir_all(&paths.runtime_dir)?;
-    migrate_old_layout(paths);
+    fs::create_dir_all(&paths.data_dir)
+        .with_context(|| format!("无法创建 {}", paths.data_dir.display()))?;
+    fs::create_dir_all(&paths.state_dir)?;
 
     let cfg_action = ensure_config(paths)?;
     ensure_zju_bin(paths)?;
@@ -59,25 +62,9 @@ pub fn cmd_install(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// 0.2.1 起把「全塞在 ~/.config/easy-proxy」的旧布局迁移过来：运行时文件挪去 ~/.easy-proxy，
-/// 顶层 zju-connect 旧副本清掉（由 bin/zju-connect 取代）。best-effort，出错不影响安装。
-fn migrate_old_layout(paths: &Paths) {
-    let old = |name: &str| paths.config_dir.join(name);
-    // 状态文件：能移就移（尽量保住「已连接」视图），移不动就算了
-    let old_state = old("state.json");
-    if old_state.exists() && !paths.state.exists() {
-        let _ = fs::create_dir_all(&paths.runtime_dir);
-        let _ = fs::rename(&old_state, &paths.state);
-    }
-    // 旧位置遗留：日志会重建、cookie 是临时、顶层 zju-connect 由 bin/ 取代 → 直接清掉
-    for name in ["zju-connect", "daemon.log", "tunnel.log", ".cookies", "state.json"] {
-        let _ = fs::remove_file(old(name));
-    }
-}
-
-/// 释放内嵌 zju-connect 到 ~/.config/easy-proxy/bin/zju-connect（缺失或大小不符才重写），赋可执行权限并去隔离属性。
+/// 释放内嵌 zju-connect 到 ~/.local/share/easy-proxy/zju-connect（缺失或大小不符才重写），赋可执行权限并去隔离属性。
 pub fn ensure_zju_bin(paths: &Paths) -> Result<()> {
-    fs::create_dir_all(&paths.bin_dir)?;
+    fs::create_dir_all(&paths.data_dir)?;
     let need = match fs::metadata(&paths.zju_bin) {
         Ok(m) => m.len() != ZJU_BIN.len() as u64,
         Err(_) => true,
@@ -116,7 +103,7 @@ mixed_port: 7899
 # 取不到就回退手动输入（自动期间可随时按 esc 取消，直接转手动）。命令经 `sh -c` 执行；
 # 脚本自己负责轮询等码、往前看多久、是否过期，只需把 4–8 位数字打到 stdout（是否有效由服务端最终校验）。
 # 示例脚本见 README（不随程序内置）。
-# sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"
+# sms_command: "python3 ~/.local/share/easy-proxy/scripts/get_sms.py"
 # sms_retries: 1              # 自动取码额度：总轮数=1+该值。没取到会补发一次短信重取；被拒则不重发只重读。默认 1
 # sms_retry_interval_secs: 30 # 「被拒后重读」前的等待秒数（给正确验证码送达的时间）。默认 30
 prompt:
@@ -129,40 +116,28 @@ prompt:
     .to_string()
 }
 
+/// 补全源文件写数据目录，再软链到 ~/.local/share/zsh/site-functions（与 verge-proxy 一致，
+/// 不再依赖 brew --prefix：该目录归用户所有，install.sh 负责把它挂到 fpath 上）。
 fn write_completion(paths: &Paths) -> Result<(Action, PathBuf)> {
-    fs::create_dir_all(&paths.completions_dir)?;
-    fs::write(&paths.completion_file, completion_script())?;
-    // 软链到 zsh site-functions（与 verge-proxy 一致的位置），让补全真正生效
-    match completion_site_functions_dir() {
-        Ok(dir) => {
-            let target = dir.join("_easy-proxy");
-            let existed = target.exists() || fs::symlink_metadata(&target).is_ok();
-            fs::create_dir_all(&dir)?;
-            if existed {
-                let _ = fs::remove_file(&target);
-            }
-            std::os::unix::fs::symlink(&paths.completion_file, &target)
-                .with_context(|| format!("无法创建补全软链接 {}", target.display()))?;
-            Ok((if existed { Action::Updated } else { Action::Set }, target))
-        }
-        // 没有 brew（或解析失败）时，退回只写源文件并报告源路径
-        Err(_) => Ok((Action::Set, paths.completion_file.clone())),
-    }
-}
+    fs::create_dir_all(&paths.data_dir)?;
+    fs::write(&paths.completion_file, completion_script())
+        .with_context(|| format!("无法写入 {}", paths.completion_file.display()))?;
 
-fn completion_site_functions_dir() -> Result<PathBuf> {
-    let output = Command::new("brew")
-        .arg("--prefix")
-        .output()
-        .context("无法执行 brew --prefix")?;
-    if !output.status.success() {
-        return Err(anyhow!("brew --prefix 失败"));
+    let link = &paths.completion_link;
+    let existed = fs::symlink_metadata(link).is_ok();
+    fs::create_dir_all(&paths.zsh_functions_dir)?;
+    if existed {
+        fs::remove_file(link)
+            .with_context(|| format!("无法移除旧补全配置 {}", link.display()))?;
     }
-    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if prefix.is_empty() {
-        return Err(anyhow!("brew --prefix 返回空路径"));
-    }
-    Ok(PathBuf::from(prefix).join("share/zsh/site-functions"))
+    std::os::unix::fs::symlink(&paths.completion_file, link).with_context(|| {
+        format!(
+            "无法创建补全软链接 {} -> {}",
+            link.display(),
+            paths.completion_file.display()
+        )
+    })?;
+    Ok((if existed { Action::Updated } else { Action::Set }, link.clone()))
 }
 
 fn completion_script() -> &'static str {

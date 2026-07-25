@@ -12,8 +12,12 @@ CLI 约定参照姊妹项目 `verge-proxy`：eval 式 `start/stop`、powerline �
 curl -fsSL https://raw.githubusercontent.com/Hanyang-Li/easy-proxy/main/install.sh | sh
 ```
 
-脚本从 GitHub Releases 下载 Apple Silicon（M 系列）二进制到 `/usr/local/bin`，并执行 `easy-proxy install`。
-可设置 `VERSION=v0.2.0` 安装指定版本。装完后编辑 `~/.config/easy-proxy/config.yaml` 填入 `server` 与 `username`，再 `source ~/.zshrc`。
+脚本从 GitHub Releases 下载 Apple Silicon（M 系列）二进制、校验 sha256，装到 `~/.local/bin`，再执行 `easy-proxy install`。
+**全程在 `$HOME` 下，不需要 sudo**；`~/.local/bin` 不在 `PATH`、`~/.local/share/zsh/site-functions` 不在 zsh `fpath` 时，会分别往 shell rc 里补一行。
+
+环境变量：`VERSION=v1.0.0` 装指定版本、`INSTALL_DIR=/path` 换安装目录（不可写时才回退 sudo）、`NO_MODIFY_PATH=1` 不改 rc 只打印手动提示。
+
+装完后编辑 `~/.config/easy-proxy/config.yaml` 填入 `server` 与 `username`，再 `source ~/.zshrc`。
 
 ### 从源码构建
 
@@ -23,37 +27,56 @@ curl -fsSL https://raw.githubusercontent.com/Hanyang-Li/easy-proxy/main/install.
 
 ```sh
 cargo build --release
-sudo cp target/release/easy-proxy /usr/local/bin/easy-proxy
+install -m 0755 target/release/easy-proxy ~/.local/bin/easy-proxy
 easy-proxy install
 source ~/.zshrc
 ```
 
 `install` 会：
 - 写默认配置 `~/.config/easy-proxy/config.yaml`
-- 释放内嵌的 `zju-connect` 到 `~/.config/easy-proxy/bin/zju-connect`
-- 生成 zsh 补全 `~/.config/easy-proxy/completions/_easy-proxy`
+- 释放内嵌的 `zju-connect` 到 `~/.local/share/easy-proxy/zju-connect`
+- 生成 zsh 补全 `~/.local/share/easy-proxy/_easy-proxy`，并软链到 `~/.local/share/zsh/site-functions/_easy-proxy`
 - 在 `~/.zshrc` 的托管块（`# >>> easy-proxy >>>` … `# <<< easy-proxy <<<`）里写入 `easy-proxy()` wrapper 与 `ep()` 函数
 
 二进制**自包含**（`zju-connect` 编译期内嵌），拷走单个文件即可用。
 
 ## 目录结构
 
-配置/资源与运行时产物分开放：
+1.0.0 起按 XDG 风味分四段，全在 `$HOME` 下、不需要 sudo：
 
 ```
-~/.config/easy-proxy/          # 静态配置与资源
-├── config.yaml                #   配置
-├── completions/_easy-proxy    #   zsh 补全
-├── bin/zju-connect            #   释放出的隧道后端
-└── scripts/get_sms.py         #   （可选）你自备的自动取码脚本
+~/.local/bin/easy-proxy        # 二进制（自包含）
 
-~/.easy-proxy/                 # 运行时产物（不与配置混放）
+~/.config/easy-proxy/          # 配置：只有一个文件
+└── config.yaml
+
+~/.local/share/easy-proxy/     # 数据：程序自带资源 + 你自备的脚本
+├── zju-connect                #   释放出的隧道后端
+├── _easy-proxy                #   zsh 补全源文件
+└── scripts/get_sms.py         #   （可选）你自备的自动取码脚本
+~/.local/share/zsh/site-functions/_easy-proxy   # → 软链到上面的补全源文件
+
+~/.local/state/easy-proxy/     # 运行时状态（不与配置混放）
 ├── state.json                 #   连接状态（status/port 读它）
 ├── daemon.log / tunnel.log    #   守护进程 / zju-connect 日志
-└── .cookies                   #   登录时的临时 cookie
+└── .cookies                   #   前台 connect 的临时 cookie
+
+~/.cache/easy-proxy/           # 可随时删
+└── silent.cookies             #   守护进程静默重登的一次性 jar
 ```
 
-（从 0.2.0 及更早版本升级时，`install` 会自动把旧的运行时文件挪出配置目录、清掉顶层旧 `zju-connect`。）
+从 0.4.x 及更早版本升级是**一次性断裂**，`install` 不做自动迁移（旧布局散在 `/usr/local/bin`、
+`~/.config/easy-proxy/{bin,completions}`、`~/.easy-proxy`、`$(brew --prefix)/share/zsh/site-functions`）。
+先 `easy-proxy disconnect`（用旧二进制停掉守护），装完新版后手动清理：
+
+```sh
+sudo rm -f /usr/local/bin/easy-proxy
+rm -rf ~/.config/easy-proxy/bin ~/.config/easy-proxy/completions ~/.easy-proxy
+rm -f "$(brew --prefix)/share/zsh/site-functions/_easy-proxy"
+mv ~/.config/easy-proxy/scripts ~/.local/share/easy-proxy/scripts   # 如果配了取码脚本
+```
+
+取码脚本挪位后记得同步改 `config.yaml` 里的 `sms_command` 路径。
 
 ## 命令
 
@@ -89,7 +112,7 @@ server: "vpn.example.com"       # 你的深信服 EasyConnect 门户地址
 port: 443
 username: "your-name@example.com"
 mixed_port: 7899          # 本机对外暴露的混合端口（避开 clash verge 的 7897 等）
-# sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"   # 可选：自动取码命令（见「自动获取短信验证码」）
+# sms_command: "python3 ~/.local/share/easy-proxy/scripts/get_sms.py"   # 可选：自动取码命令（见「自动获取短信验证码」）
 healthcheck_interval: 60         # 兜底心跳（秒）：切网、唤醒由路由事件秒级触发探测，此周期只是兜底
 healthcheck_fail_threshold: 2    # 连续探测失败几次判定断线（躲开单次抖动）
 silent_relogin_interval: 3600    # 静默重登最小间隔（秒），按上次发码时刻限流下一次自动重登
@@ -145,7 +168,7 @@ connect ──login(纯HTTP: login_auth→psw_config→RSA(PKCS1v15)→login_psw
 **取码命令**让它自动完成：
 
 ```yaml
-sms_command: "python3 ~/.config/easy-proxy/scripts/get_sms.py"
+sms_command: "python3 ~/.local/share/easy-proxy/scripts/get_sms.py"
 sms_retries: 1               # 自动取码额度：总轮数=1+该值。没取到会补发新码，被拒则复用不重发。默认 1
 sms_retry_interval_secs: 30  # 每轮进下一轮前统一等待秒数，默认 30
 ```
@@ -164,7 +187,7 @@ sms_retry_interval_secs: 30  # 每轮进下一轮前统一等待秒数，默认 
 
 > **为什么判据是「有效期」而不是「本次登录后才收到」**：被服务端拒时 easy-proxy 不重发、要你复用现有码（5 分钟内仍有效）；仅当「没取到」才 `post_sms.csp` 补发新码（约 30s 间隔）。所以脚本该找「仍在有效期内的最新一条码」（刚发的或仍有效的旧的都行），而不是死等一条"本次登录后"的新短信。
 
-**示例：从 macOS「信息」`chat.db` 轮询读取**（自行放到 `~/.config/easy-proxy/scripts/get_sms.py`，按你的短信文案调整关键词/正则）。用 `LOOKBACK_SECS` 往前看、再用短信自带的「有效期截止 HH:MM」精确校验未过期：
+**示例：从 macOS「信息」`chat.db` 轮询读取**（自行放到 `~/.local/share/easy-proxy/scripts/get_sms.py`，按你的短信文案调整关键词/正则）。用 `LOOKBACK_SECS` 往前看、再用短信自带的「有效期截止 HH:MM」精确校验未过期：
 
 ```python
 #!/usr/bin/env python3

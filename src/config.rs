@@ -180,19 +180,27 @@ pub struct RuntimeState {
     pub error: Option<String>,
 }
 
+/// XDG 风味的四段布局（1.0.0）：配置 / 数据 / 运行时状态 / 缓存各归其位，都在 $HOME 下、无需 sudo。
 #[derive(Debug, Clone)]
 pub struct Paths {
-    /// 静态配置/资源目录 ~/.config/easy-proxy（config.yaml、completions/、scripts/、bin/）
+    /// 配置目录 ~/.config/easy-proxy（只放 config.yaml）
     pub config_dir: PathBuf,
-    /// 运行时目录 ~/.easy-proxy（日志 / 状态 / 临时 cookie，不与配置混放）
-    pub runtime_dir: PathBuf,
+    /// 数据目录 ~/.local/share/easy-proxy（zju-connect、补全源文件、你自备的取码脚本）
+    pub data_dir: PathBuf,
+    /// 补全软链目录 ~/.local/share/zsh/site-functions（需在 zsh fpath 上）
+    pub zsh_functions_dir: PathBuf,
+    /// 运行时状态目录 ~/.local/state/easy-proxy（状态 / 日志 / 登录 cookie）
+    pub state_dir: PathBuf,
+    /// 缓存目录 ~/.cache/easy-proxy（可随时删的临时产物）
+    pub cache_dir: PathBuf,
     pub app_config: PathBuf,
-    pub bin_dir: PathBuf,
     pub zju_bin: PathBuf,
-    pub completions_dir: PathBuf,
     pub completion_file: PathBuf,
+    pub completion_link: PathBuf,
     pub state: PathBuf,
     pub cookies: PathBuf,
+    /// 守护进程静默重登的临时 cookie jar：可丢弃，不与前台 connect 抢同一个 jar
+    pub silent_cookies: PathBuf,
     pub daemon_log: PathBuf,
     pub tunnel_log: PathBuf,
     pub zshrc: PathBuf,
@@ -202,21 +210,28 @@ impl Paths {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 HOME"))?;
         let config_dir = home.join(".config/easy-proxy");
-        let runtime_dir = home.join(".easy-proxy");
+        let data_dir = home.join(".local/share/easy-proxy");
+        let zsh_functions_dir = home.join(".local/share/zsh/site-functions");
+        let state_dir = home.join(".local/state/easy-proxy");
+        let cache_dir = home.join(".cache/easy-proxy");
         Ok(Self {
             app_config: config_dir.join("config.yaml"),
-            bin_dir: config_dir.join("bin"),
-            zju_bin: config_dir.join("bin/zju-connect"),
-            completions_dir: config_dir.join("completions"),
-            completion_file: config_dir.join("completions/_easy-proxy"),
-            // 运行时产物集中到 ~/.easy-proxy，不塞进配置目录
-            state: runtime_dir.join("state.json"),
-            cookies: runtime_dir.join(".cookies"),
-            daemon_log: runtime_dir.join("daemon.log"),
-            tunnel_log: runtime_dir.join("tunnel.log"),
+            // 程序自带资源放数据目录
+            zju_bin: data_dir.join("zju-connect"),
+            completion_file: data_dir.join("_easy-proxy"),
+            completion_link: zsh_functions_dir.join("_easy-proxy"),
+            // 运行时产物集中到 ~/.local/state/easy-proxy，不塞进配置目录
+            state: state_dir.join("state.json"),
+            cookies: state_dir.join(".cookies"),
+            daemon_log: state_dir.join("daemon.log"),
+            tunnel_log: state_dir.join("tunnel.log"),
+            silent_cookies: cache_dir.join("silent.cookies"),
             zshrc: home.join(".zshrc"),
-            runtime_dir,
             config_dir,
+            data_dir,
+            zsh_functions_dir,
+            state_dir,
+            cache_dir,
         })
     }
 
@@ -233,7 +248,7 @@ impl Paths {
     }
 
     pub fn write_state(&self, state: &RuntimeState) -> Result<()> {
-        fs::create_dir_all(&self.runtime_dir)?;
+        fs::create_dir_all(&self.state_dir)?;
         let tmp = self.state.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
         fs::rename(&tmp, &self.state)?;
@@ -308,16 +323,20 @@ mod tests {
     }
 
     #[test]
-    fn paths_layout_config_vs_runtime() {
+    fn paths_layout_config_data_state_cache() {
         let p = Paths::new().unwrap();
-        // 静态配置/资源留在 ~/.config/easy-proxy
+        // 配置只留 config.yaml
         assert!(p.app_config.ends_with(".config/easy-proxy/config.yaml"));
-        assert!(p.zju_bin.ends_with(".config/easy-proxy/bin/zju-connect"));
-        assert!(p.completion_file.ends_with(".config/easy-proxy/completions/_easy-proxy"));
-        // 运行时产物集中到 ~/.easy-proxy
-        assert!(p.state.ends_with(".easy-proxy/state.json"));
-        assert!(p.cookies.ends_with(".easy-proxy/.cookies"));
-        assert!(p.daemon_log.ends_with(".easy-proxy/daemon.log"));
-        assert!(p.tunnel_log.ends_with(".easy-proxy/tunnel.log"));
+        // 程序资源在数据目录，补全软链在 zsh fpath 目录
+        assert!(p.zju_bin.ends_with(".local/share/easy-proxy/zju-connect"));
+        assert!(p.completion_file.ends_with(".local/share/easy-proxy/_easy-proxy"));
+        assert!(p.completion_link.ends_with(".local/share/zsh/site-functions/_easy-proxy"));
+        // 运行时产物集中到 ~/.local/state/easy-proxy
+        assert!(p.state.ends_with(".local/state/easy-proxy/state.json"));
+        assert!(p.cookies.ends_with(".local/state/easy-proxy/.cookies"));
+        assert!(p.daemon_log.ends_with(".local/state/easy-proxy/daemon.log"));
+        assert!(p.tunnel_log.ends_with(".local/state/easy-proxy/tunnel.log"));
+        // 可丢弃的临时产物在缓存目录
+        assert!(p.silent_cookies.ends_with(".cache/easy-proxy/silent.cookies"));
     }
 }
