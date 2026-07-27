@@ -31,6 +31,9 @@ pub struct ServeArgs {
     http: String,
     #[arg(long = "last-sms-sent", default_value_t = 0)]
     last_sms_sent: u64,
+    /// TUN 透明模式:隧道经 root helper 拉起
+    #[arg(long, default_value_t = false)]
+    tun: bool,
 }
 
 pub fn serve(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
@@ -54,11 +57,105 @@ fn zju_args(a: &ServeArgs) -> Vec<String> {
     ]
 }
 
+/// 构造隧道启动命令:Proxy 直接跑用户态 zju-connect;TUN 经 sudo -n helper(root)。
+/// TUN 分支先做 Rust 侧预校验,坏参数在 spawn 前就报错(helper 内还有最终校验)。
+fn tunnel_command(paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<Command> {
+    if args.tun {
+        crate::tun::validate_serve(&args.server, twfid, &args.socks, &args.http)?;
+        let mut cmd = Command::new("/usr/bin/sudo");
+        cmd.arg("-n")
+            .arg(crate::tun::HELPER_PATH)
+            .arg("start-tunnel")
+            .arg("--server").arg(&args.server)
+            .arg("--https-port").arg(args.https_port.to_string())
+            .arg("--twfid").arg(twfid)
+            .arg("--socks").arg(&args.socks)
+            .arg("--http").arg(&args.http);
+        Ok(cmd)
+    } else {
+        let mut a = args.clone();
+        a.twfid = twfid.to_string();
+        let mut cmd = Command::new(&paths.zju_bin);
+        cmd.args(zju_args(&a));
+        Ok(cmd)
+    }
+}
+
+/// 停掉隧道进程并回收:TUN 模式 daemon 无权 signal root 子进程(EPERM),
+/// 一律走 helper stop-tunnel(pidfile);Proxy 维持 start_kill。两者都必须 wait 回收。
+async fn kill_tunnel(child: &mut Child, tun: bool) {
+    if tun {
+        let _ = Command::new("/usr/bin/sudo")
+            .args(["-n", crate::tun::HELPER_PATH, "stop-tunnel"])
+            .output()
+            .await;
+    } else {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
+}
+
+/// TUN 启动护栏(spec §7.1 第 7 步):就绪后立即执行,失败绝不假 online。
+/// a) 服务端未下发网段(Add route to == 0)→ TUN 无意义;
+/// b) 默认路由接口是 utun* → 违反分流不变量(防上游行为变化)。
+fn tun_guardrails(paths: &Paths) -> Result<()> {
+    let log = crate::config::read_tail_bytes(&paths.tunnel_log, 512 * 1024);
+    if crate::tun::count_add_route(&log) == 0 {
+        return Err(anyhow!("服务端未下发内网网段(tunnel.log 无 Add route to),TUN 不可用"));
+    }
+    if let Ok(out) = std::process::Command::new("/sbin/route").args(["-n", "get", "default"]).output() {
+        if crate::tun::default_route_is_utun(&String::from_utf8_lossy(&out.stdout)) {
+            return Err(anyhow!("默认路由指向 utun,违反分流不变量,回滚"));
+        }
+    }
+    Ok(())
+}
+
+/// 隧道就绪后同步 scoped resolver(幂等):dns_suffixes 非空且拿到 vpn_dns 才写;
+/// 失败只警告不致命——resolver 缺失时内网域名仍可走 7899 代理路径。
+async fn tun_dns_sync(cfg: &AppConfig, state: &RuntimeState) {
+    let suffixes: Vec<&str> = cfg
+        .tun
+        .dns_suffixes
+        .iter()
+        .map(String::as_str)
+        .filter(|s| {
+            let ok = crate::tun::valid_suffix(s);
+            if !ok {
+                eprintln!("[daemon] dns_suffixes 含非法项,跳过: {s}");
+            }
+            ok
+        })
+        .collect();
+    if suffixes.is_empty() {
+        return;
+    }
+    let Some(dns) = state.vpn_dns.as_deref().filter(|d| crate::tun::valid_ipv4(d)) else {
+        eprintln!("[daemon] 未获得可用 VPN DNS,跳过 scoped resolver 配置(域名解析可走 7899 代理)");
+        return;
+    };
+    let mut cmd = Command::new("/usr/bin/sudo");
+    cmd.arg("-n").arg(crate::tun::HELPER_PATH).arg("dns-sync");
+    for s in &suffixes {
+        cmd.arg(format!("{s}={dns}"));
+    }
+    match cmd.output().await {
+        Ok(out) if out.status.success() => {
+            eprintln!("[daemon] scoped resolver 已同步: {} 个后缀 → {dns}", suffixes.len());
+        }
+        Ok(out) => eprintln!(
+            "[daemon] dns-sync 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!("[daemon] dns-sync 无法执行: {e}"),
+    }
+}
+
 async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     let pid = std::process::id() as i32;
     let mut state = RuntimeState {
         phase: crate::config::Phase::Reconnecting,
-        mode: crate::config::Mode::Proxy,
+        mode: if args.tun { crate::config::Mode::Tun } else { crate::config::Mode::Proxy },
         daemon_pid: pid,
         port: args.mixed_port,
         socks_upstream: args.socks.clone(),
@@ -73,8 +170,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
 
     let log = std::fs::File::create(&paths.tunnel_log)
         .with_context(|| format!("无法创建 {}", paths.tunnel_log.display()))?;
-    let mut child = Command::new(&paths.zju_bin)
-        .args(zju_args(&args))
+    let mut child = tunnel_command(paths, &args, &args.twfid)?
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -87,17 +183,28 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
             state.vpn_dns = pick_probe_target(&args, info.vpn_dns).await;
         }
         Err(e) => {
-            let _ = child.start_kill();
+            kill_tunnel(&mut child, args.tun).await;
             state.error = Some(e.to_string());
             let _ = paths.write_state(&state);
             return Err(e);
         }
     }
 
+    // TUN 启动护栏 + scoped resolver:就绪后立即执行,护栏失败绝不假 online
+    if args.tun {
+        if let Err(e) = tun_guardrails(paths) {
+            kill_tunnel(&mut child, true).await;
+            state.error = Some(e.to_string());
+            let _ = paths.write_state(&state);
+            return Err(e);
+        }
+        tun_dns_sync(&cfg, &state).await;
+    }
+
     let listener = match TcpListener::bind(("127.0.0.1", args.mixed_port)).await {
         Ok(l) => l,
         Err(e) => {
-            let _ = child.start_kill();
+            kill_tunnel(&mut child, args.tun).await;
             let msg = format!("绑定混合端口 127.0.0.1:{} 失败: {e}", args.mixed_port);
             state.error = Some(msg.clone());
             let _ = paths.write_state(&state);
@@ -260,22 +367,26 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     if let Some(c) = route_child.as_mut() {
         let _ = c.start_kill();
     }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    // shutdown 顺序(spec §7.2):stop-tunnel(优雅,zju 自身 hook 关 utun)→ dns-clean → clear_state
+    kill_tunnel(&mut child, args.tun).await;
+    if args.tun {
+        // 优雅退出才清 resolver;崩溃残留由下次 janitor 兜底
+        let _ = Command::new("/usr/bin/sudo")
+            .args(["-n", crate::tun::HELPER_PATH, "dns-clean"])
+            .output()
+            .await;
+    }
     paths.clear_state();
     Ok(())
 }
 
 /// 用给定 twfid 重启 zju-connect:回收旧进程 → truncate 日志 → 起新进程 → 等 SOCKS 就绪。
+/// TUN 模式下停/起都经 helper(root),日志经 fd 继承照写 tunnel.log。
 async fn restart_zju(child: &mut Child, paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<ReadyInfo> {
-    let _ = child.start_kill();
-    let _ = child.wait().await; // 回收旧进程,杜绝僵尸
+    kill_tunnel(child, args.tun).await; // 回收旧进程,杜绝僵尸
     let log = std::fs::File::create(&paths.tunnel_log)
         .with_context(|| format!("无法创建 {}", paths.tunnel_log.display()))?;
-    let mut a = args.clone();
-    a.twfid = twfid.to_string();
-    let new_child = Command::new(&paths.zju_bin)
-        .args(zju_args(&a))
+    let new_child = tunnel_command(paths, args, twfid)?
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -370,6 +481,13 @@ async fn attempt_recover(
                 state.tunnel_ip = info.ip;
                 state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
                 if probe(args, state.vpn_dns.as_deref()).await {
+                    if args.tun {
+                        if let Err(e) = tun_guardrails(paths) {
+                            eprintln!("[daemon] 恢复后护栏失败: {e}");
+                            return RecoverOutcome::GiveUp;
+                        }
+                        tun_dns_sync(cfg, state).await;
+                    }
                     eprintln!("[daemon] 旧 TWFID 重启成功");
                     return RecoverOutcome::Online;
                 }
@@ -428,6 +546,13 @@ async fn attempt_recover(
             state.tunnel_ip = info.ip;
             state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
             if probe(args, state.vpn_dns.as_deref()).await {
+                if args.tun {
+                    if let Err(e) = tun_guardrails(paths) {
+                        eprintln!("[daemon] 恢复后护栏失败: {e}");
+                        return RecoverOutcome::GiveUp;
+                    }
+                    tun_dns_sync(cfg, state).await;
+                }
                 eprintln!("[daemon] 静默重登并重启成功");
                 RecoverOutcome::Online
             } else {
