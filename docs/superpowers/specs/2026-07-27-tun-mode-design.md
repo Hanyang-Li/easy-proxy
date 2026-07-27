@@ -120,7 +120,7 @@ tun:
 ### 7.1 `connect --tun/-t`
 
 1. 既有前置检查照旧(foreign_proxy_name、已在线判断、config 校验)。
-2. TUN 就绪检查:helper 与 sudoers 已安装且 `sudo -n` 可用、root copy 与内嵌二进制版本一致。不满足则**交互询问**「TUN 组件未安装(或版本过旧),是否现在安装?需输入一次 sudo 密码」——确认即当场执行 `install --tun` 流程后继续 connect;拒绝则中止并提示可手动执行 `easy-proxy install --tun`;无 tty(自动化)场景不询问,直接报错退出。
+2. TUN 就绪检查:helper 与 sudoers 已安装且 `sudo -n` 可用、root copy 与内嵌二进制版本一致。不满足则**直接当场安装**(与 `install --tun` 同一流程,由 `›` 开头、自带用途说明的 sudo 密码行承接,不另行询问、不显示裸 `Password:`);无 tty(自动化)场景 sudo 无法要密码,直接报错并提示手动执行 `easy-proxy install --tun`。
 3. **janitor**(`sudo -n helper janitor`):清上次残留(resolver 文件、孤儿 root 隧道、pidfile)。
 4. 登录流程完全复用(密码 → 短信 → TWFID)。
 5. spawn 用户态 daemon(setsid),`ServeArgs` 加 `--tun`。

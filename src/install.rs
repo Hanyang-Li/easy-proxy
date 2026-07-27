@@ -3,7 +3,7 @@
 //! 落盘位置见 [`crate::config::Paths`]：配置 ~/.config/easy-proxy、数据 ~/.local/share/easy-proxy、
 //! 补全软链 ~/.local/share/zsh/site-functions，全在 $HOME 下，不需要 sudo。
 
-use crate::capsule::success_line;
+use crate::capsule::{success_line, ANSI_BOLD_BLUE, ANSI_RESET};
 use crate::config::{Paths, PromptConfig};
 use anyhow::{Context, Result};
 use std::env;
@@ -36,6 +36,10 @@ impl Action {
 }
 
 pub fn cmd_install(paths: &Paths, tun: bool) -> Result<()> {
+    // --tun 只装 TUN 权限组件,不重跑常规安装(zshrc/补全/配置早已就位)
+    if tun {
+        return install_tun(paths);
+    }
     fs::create_dir_all(&paths.config_dir)
         .with_context(|| format!("无法创建 {}", paths.config_dir.display()))?;
     fs::create_dir_all(&paths.data_dir)
@@ -55,9 +59,6 @@ pub fn cmd_install(paths: &Paths, tun: bool) -> Result<()> {
         "{}",
         success_line(&format!("zju-connect 已就绪: {}", paths.zju_bin.display()), None, &prompt)
     );
-    if tun {
-        install_tun(paths)?;
-    }
     println!(
         "{}",
         success_line("完成。执行 source ~/.zshrc 或打开新终端后生效", None, &prompt)
@@ -68,6 +69,12 @@ pub fn cmd_install(paths: &Paths, tun: bool) -> Result<()> {
 /// sudoers 单行内容:只 NOPASSWD 授权固定路径的 helper 这一个入口。
 fn sudoers_content(user: &str) -> String {
     format!("{user} ALL=(root) NOPASSWD: {}\n", crate::tun::HELPER_PATH)
+}
+
+/// sudo 密码提示(`sudo -p`,替换默认的 Password:):与 dialoguer 的 `› 标签: ` 输入行
+/// 同风格,自带用途说明——不另打预告行(凭证有缓存时 sudo 根本不会问,预告反而成噪音)。
+fn sudo_password_prompt(action: &str) -> String {
+    format!("{ANSI_BOLD_BLUE}›{ANSI_RESET} {action}需要 root, 请输入 sudo 密码: ")
 }
 
 fn current_username() -> Result<String> {
@@ -101,11 +108,11 @@ pub fn install_tun(paths: &Paths) -> Result<()> {
 install -d -o root -g wheel -m 0755 "$1"
 install -o root -g wheel -m 0755 "$2" "$1/ep-tun-helper"
 install -o root -g wheel -m 0755 "$3" "$1/zju-connect"
-visudo -cf "$4"
+visudo -cf "$4" >/dev/null
 install -o root -g wheel -m 0440 "$4" /etc/sudoers.d/easy-proxy
 "#;
-    eprintln!("  安装 TUN 权限组件需要 root,请输入 sudo 密码(仅此一次):");
     let status = Command::new("/usr/bin/sudo")
+        .arg("-p").arg(sudo_password_prompt("安装 TUN 权限组件"))
         .arg("/bin/sh").arg("-c").arg(script).arg("sh")
         .arg(crate::tun::HELPER_DIR)
         .arg(&helper_tmp)
@@ -116,7 +123,7 @@ install -o root -g wheel -m 0440 "$4" /etc/sudoers.d/easy-proxy
     let _ = fs::remove_file(&helper_tmp);
     let _ = fs::remove_file(&sudoers_tmp);
     if !status.success() {
-        return Err(anyhow::anyhow!("TUN 组件安装失败(sudo 退出 {status})"));
+        return Err(anyhow::anyhow!("TUN 组件安装失败(sudo 退出码 {})", status.code().unwrap_or(-1)));
     }
     // 自检:免密路径立即可用(顺带完成一次 janitor 清场)
     crate::tun::janitor().context("安装自检失败:sudo -n 免密调用 helper 不可用")?;
@@ -124,7 +131,7 @@ install -o root -g wheel -m 0440 "$4" /etc/sudoers.d/easy-proxy
     let prompt = PromptConfig::default();
     println!("{}", success_line(&format!("已安装 root helper: {}", crate::tun::HELPER_PATH), None, &prompt));
     println!("{}", success_line(&format!("已安装 sudoers 免密规则: {}", crate::tun::SUDOERS_PATH), None, &prompt));
-    println!("{}", success_line("TUN 组件就绪(免密自检通过)", None, &prompt));
+    println!("{}", success_line("TUN 组件就绪", None, &prompt));
     Ok(())
 }
 
@@ -162,21 +169,18 @@ rm -f /etc/sudoers.d/easy-proxy
 rm -rf /usr/local/libexec/easy-proxy
 exit 0
 "##;
-    eprintln!("  卸载 TUN 权限组件需要 root,请输入 sudo 密码:");
     let status = Command::new("/usr/bin/sudo")
+        .arg("-p").arg(sudo_password_prompt("卸载 TUN 权限组件"))
         .arg("/bin/sh").arg("-c").arg(script)
         .status()
         .context("无法执行 sudo")?;
     if !status.success() {
-        return Err(anyhow::anyhow!("卸载失败(sudo 退出 {status})"));
+        return Err(anyhow::anyhow!("卸载失败(sudo 退出码 {})", status.code().unwrap_or(-1)));
     }
-    if helper_installed {
-        println!("{}", success_line(&format!("已删除 {}", crate::tun::HELPER_DIR), None, &prompt));
-    }
-    if sudoers_installed {
-        println!("{}", success_line(&format!("已删除 {}", crate::tun::SUDOERS_PATH), None, &prompt));
-    }
-    println!("{}", success_line("TUN 组件已卸载(resolver 残留与孤儿隧道一并清理)", None, &prompt));
+    println!(
+        "{}",
+        success_line("TUN 组件已卸载: helper、sudoers、resolver 残留、孤儿隧道均已清理", None, &prompt)
+    );
     Ok(())
 }
 

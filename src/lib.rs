@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -517,31 +517,22 @@ fn automation_via_file(cfg: &AppConfig, jar: &Path, path: &str) -> Result<String
     Err(anyhow!("[自动化] 验证码连续 {FILE_ATTEMPTS} 次被拒"))
 }
 
-/// TUN 就绪检查(spec §7.1 第 2 步):组件缺失/过旧时交互引导当场安装;
-/// 无 tty(自动化)不询问,直接报错退出。
+/// TUN 就绪检查(spec §7.1 第 2 步):组件缺失/过旧时直接当场安装——由 sudo 密码行
+/// (`›` 开头,自带用途说明)承接,与 install --tun 完全同一流程,不另行询问。
+/// 无 tty(自动化)场景 sudo 无法要密码,直接报错退出。
 fn ensure_tun_ready(paths: &Paths) -> Result<()> {
     let readiness = tun::check_ready(paths);
     if readiness == tun::Readiness::Ready {
         return Ok(());
     }
-    let what = match readiness {
-        tun::Readiness::NotInstalled => "TUN 组件未安装",
-        _ => "TUN 组件版本过旧",
-    };
     if !std::io::stdin().is_terminal() {
+        let what = match readiness {
+            tun::Readiness::NotInstalled => "TUN 组件未安装",
+            _ => "TUN 组件版本过旧",
+        };
         return Err(anyhow!("{what},请先执行 easy-proxy install --tun"));
     }
-    let yes = prompt_or_exit(
-        dialoguer::Confirm::with_theme(&ep_theme())
-            .with_prompt(format!("{what},现在安装吗?(需输入一次 sudo 密码)"))
-            .default(true)
-            .interact(),
-    )?;
-    if !yes {
-        return Err(anyhow!("已取消。可稍后手动执行 easy-proxy install --tun"));
-    }
-    install::install_tun(paths)?;
-    Ok(())
+    install::install_tun(paths)
 }
 
 fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) -> Result<()> {
@@ -558,12 +549,13 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) ->
     if let Some(st) = paths.read_state() {
         if tunnel::pid_alive(st.daemon_pid) {
             if st.phase == config::Phase::Online {
-                // 双模式互斥:已有另一模式的连接时不静默复用,提示先 disconnect
+                // 双模式互斥:已有另一模式的连接时不静默复用——这是「拒绝操作」,
+                // 与其他拒绝一致走红叉 + stderr + 非零退出(info_line 只留给进行中状态)
                 let running_tun = st.mode == config::Mode::Tun;
                 if running_tun != tun_mode {
-                    println!(
+                    eprintln!(
                         "{}",
-                        info_line(
+                        error_line(
                             &format!(
                                 "已有{}模式连接,如需切换请先 easy-proxy disconnect",
                                 if running_tun { " TUN " } else { "代理" }
@@ -572,7 +564,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) ->
                             &cfg.prompt,
                         )
                     );
-                    return Ok(());
+                    std::process::exit(1);
                 }
                 let status = runtime_capsule(&st);
                 if status.state == ConnState::Online {
@@ -598,7 +590,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) ->
     if tun_mode {
         ensure_tun_ready(paths)?;
         // 清上次残留:resolver 文件、孤儿 root 隧道、pidfile(spec §7.1 第 3 步)
-        tun::janitor()?;
+        tun::janitor().context("TUN 残留清理失败")?;
     }
     std::fs::create_dir_all(&paths.state_dir)?; // 登录 cookie / 状态 / 日志的落脚处
 
