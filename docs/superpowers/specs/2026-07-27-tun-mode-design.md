@@ -55,7 +55,17 @@ connect --tun (用户,前台,登录拿 TWFID)
 
 ## 5. 权限模型:install --tun + ep-tun-helper + sudoers
 
-硬约束:看门狗要在无人值守时(半夜切网、睡眠唤醒)重启 root 隧道。macOS sudo 默认 `tty_tickets`,daemon 无 tty,前台 `sudo -v` 缓存的凭证 daemon 用不上——**凭证缓存方案不可行,NOPASSWD 是硬前提**。
+**速览:easy-proxy 本体保持全用户态零变化;只为「隧道进程需 root + 看门狗需免密重启它」,额外向系统安装 3 个文件,一次 `install --tun`(输一次 sudo 密码)装完,此后全程免密:**
+
+| 安装物 | 位置 | 作用 |
+|---|---|---|
+| `ep-tun-helper`(sh 脚本,root:wheel) | `/usr/local/libexec/easy-proxy/` | 免密授权的唯一入口 |
+| zju-connect root 副本(root:wheel) | `/usr/local/libexec/easy-proxy/` | root 进程只能信 root 属主、用户不可写的二进制 |
+| sudoers 单行规则(0440) | `/etc/sudoers.d/easy-proxy` | 授权当前用户免密执行 helper(且只有 helper) |
+
+推导链条:① TUN 必须 root(zju-connect 显式检查 uid=0);② 看门狗要在无人值守时(半夜切网、睡眠唤醒)重启 root 隧道,而 macOS sudo 默认 `tty_tickets`,daemon 无 tty,前台缓存的凭证用不上——**凭证缓存方案不可行,NOPASSWD 是硬前提**;③ NOPASSWD 不能直接给 zju-connect,否则用户态任意进程可 root 执行它并注入任意参数 → 只授权死板的 helper 单入口;④ helper 与二进制必须在用户不可写的 root 目录,否则换掉文件内容即等于拿到 root——所以复制 zju-connect 而非直接用 `~/.local/share` 里那份。
+
+卸载 = 删 `/etc/sudoers.d/easy-proxy` + 整个 `/usr/local/libexec/easy-proxy/`。不带 `--tun` 时这些文件完全闲置,代理模式行为不受影响。
 
 ### 5.1 `install --tun`(单次 sudo,幂等)
 
