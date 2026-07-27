@@ -154,11 +154,11 @@ pub fn cmd_uninstall(paths: &Paths, tun: bool) -> Result<()> {
         return Err(anyhow::anyhow!("目前仅支持 uninstall --tun"));
     }
     let prompt = PromptConfig::default();
-    // 先停 TUN 模式 daemon(优雅路径会自己 stop-tunnel + dns-clean)
+    // 先停 TUN 模式 daemon(优雅路径会自己 stop-tunnel + dns-clean),断开完成后再报告
     if let Some(st) = paths.read_state() {
         if st.mode == crate::config::Mode::Tun && crate::tunnel::pid_alive(st.daemon_pid) {
-            eprintln!("  检测到 TUN 连接,先断开…");
             crate::tunnel::stop_daemon_and_wait(paths, std::time::Duration::from_secs(3));
+            println!("{}", success_line("检测到 TUN 连接, 已断开", None, &prompt));
         }
     }
     let helper_installed = Path::new(crate::tun::HELPER_DIR).exists();
