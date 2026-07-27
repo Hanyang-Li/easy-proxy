@@ -574,7 +574,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     };
     let _ = std::fs::remove_file(&jar);
 
-    tunnel::spawn_daemon(paths, cfg, &twfid, last_sms.get())?;
+    tunnel::spawn_daemon(paths, cfg, &twfid, last_sms.get(), false)?;
     // 「连接中…」进度行：覆盖「建隧道就绪」+「延迟探测」整段（否则探测那几秒静默像假死），
     // 到最后一刻才清行、让 stdout 的「已连接」胶囊接上。
     let line = StatusLine::new();

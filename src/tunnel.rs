@@ -16,7 +16,13 @@ pub fn pid_alive(pid: i32) -> bool {
 }
 
 /// 以会话首进程（setsid）方式启动脱离终端的守护进程。
-pub fn spawn_daemon(paths: &Paths, cfg: &AppConfig, twfid: &str, last_sms_sent: u64) -> Result<()> {
+pub fn spawn_daemon(
+    paths: &Paths,
+    cfg: &AppConfig,
+    twfid: &str,
+    last_sms_sent: u64,
+    tun: bool,
+) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?; // 日志/状态都写在这里
     paths.clear_state();
     let exe = std::env::current_exe().context("无法定位自身可执行文件")?;
@@ -30,8 +36,11 @@ pub fn spawn_daemon(paths: &Paths, cfg: &AppConfig, twfid: &str, last_sms_sent: 
         .arg("--mixed-port").arg(cfg.mixed_port.to_string())
         .arg("--socks").arg(SOCKS_UPSTREAM)
         .arg("--http").arg(HTTP_UPSTREAM)
-        .arg("--last-sms-sent").arg(last_sms_sent.to_string())
-        .stdin(Stdio::null())
+        .arg("--last-sms-sent").arg(last_sms_sent.to_string());
+    if tun {
+        cmd.arg("--tun");
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
     unsafe {
@@ -169,10 +178,14 @@ pub fn socks_probe(
     }
 }
 
-/// 停止守护并等待其退出（至多 timeout）：SIGTERM（守护会杀掉 zju-connect 子进程）→ 轮询 pid 直到退出
-/// → 兜底 pkill zju-connect → 清状态。connect 方案 Z 靠「等它真退出再 spawn」避免抢 mixed_port。
+/// 停止守护并等待其退出（至多 timeout）：SIGTERM（守护会走优雅停隧道路径）→ 轮询 pid 直到退出
+/// → 兜底清理 → 清状态。connect 方案 Z 靠「等它真退出再 spawn」避免抢 mixed_port。
+/// 兜底按模式分流:Proxy 用 pkill 清用户态 zju-connect;TUN 的隧道是 root 进程,pkill 无效,
+/// 必须走 janitor(顺带清 resolver 残留与 pidfile)。
 pub fn stop_daemon_and_wait(paths: &Paths, timeout: Duration) {
-    if let Some(st) = paths.read_state() {
+    let st = paths.read_state();
+    let tun_mode = st.as_ref().map(|s| s.mode == crate::config::Mode::Tun).unwrap_or(false);
+    if let Some(st) = &st {
         if st.daemon_pid > 0 && pid_alive(st.daemon_pid) {
             unsafe {
                 libc::kill(st.daemon_pid, libc::SIGTERM);
@@ -183,17 +196,26 @@ pub fn stop_daemon_and_wait(paths: &Paths, timeout: Duration) {
             }
         }
     }
-    // 兜底：清掉可能残留的、由我们释放的 zju-connect
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg(paths.zju_bin.display().to_string())
-        .output();
+    if tun_mode {
+        let _ = crate::tun::sudo_helper(&["janitor"]).output();
+    } else {
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg(paths.zju_bin.display().to_string())
+            .output();
+    }
     paths.clear_state();
 }
 
-/// 停止守护（默认给 300ms 让其退出），供 disconnect 使用。
+/// 停止守护,供 disconnect 使用:TUN 模式要等 stop-tunnel → dns-clean 走完,给 3s;
+/// Proxy 维持 300ms。
 pub fn stop_daemon(paths: &Paths) {
-    stop_daemon_and_wait(paths, Duration::from_millis(300));
+    let tun_mode = paths
+        .read_state()
+        .map(|s| s.mode == crate::config::Mode::Tun)
+        .unwrap_or(false);
+    let timeout = if tun_mode { Duration::from_secs(3) } else { Duration::from_millis(300) };
+    stop_daemon_and_wait(paths, timeout);
 }
 
 #[cfg(test)]
