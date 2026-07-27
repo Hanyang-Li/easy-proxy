@@ -25,7 +25,7 @@ TUN 模式(`zju-connect -tun-mode -add-route`,需 root)能做透明接管,但一
 - `connect --tun/-t` 一键启用 TUN 透明模式:内网网段免代理直达,内网域名免配置解析。
 - 无人值守自愈不打折:现有看门狗(穿隧道 SOCKS 探针、路由事件秒级检测、分级恢复)在 TUN 模式下原样生效,重启隧道免密。
 - 任何异常退出(kill -9、崩溃、断电)不破坏本机网络;残留下次使用时自动归零。
-- 权限一次性授予(`install --tun` 单次 sudo),此后全程免密。
+- 权限一次性授予(`install --tun` 单次 sudo),此后全程免密;可随时 `uninstall --tun` 对称移除全部系统级安装物。
 
 **非目标**
 - 不用 `-dns-hijack`,不改全局 DNS,不改默认路由,不做全局透明代理(只分流服务端下发网段)。
@@ -65,7 +65,7 @@ connect --tun (用户,前台,登录拿 TWFID)
 
 推导链条:① TUN 必须 root(zju-connect 显式检查 uid=0);② 看门狗要在无人值守时(半夜切网、睡眠唤醒)重启 root 隧道,而 macOS sudo 默认 `tty_tickets`,daemon 无 tty,前台缓存的凭证用不上——**凭证缓存方案不可行,NOPASSWD 是硬前提**;③ NOPASSWD 不能直接给 zju-connect,否则用户态任意进程可 root 执行它并注入任意参数 → 只授权死板的 helper 单入口;④ helper 与二进制必须在用户不可写的 root 目录,否则换掉文件内容即等于拿到 root——所以复制 zju-connect 而非直接用 `~/.local/share` 里那份。
 
-卸载 = 删 `/etc/sudoers.d/easy-proxy` + 整个 `/usr/local/libexec/easy-proxy/`。不带 `--tun` 时这些文件完全闲置,代理模式行为不受影响。
+卸载走 `uninstall --tun`(§5.3),与安装对称。不带 `--tun` 时这些文件完全闲置,代理模式行为不受影响。
 
 ### 5.1 `install --tun`(单次 sudo,幂等)
 
@@ -92,6 +92,14 @@ helper 与安装路径**不可配置**(sudoers 必须匹配固定绝对路径,�
 | `dns-clean` | 只删 `/etc/resolver/` 下带 easy-proxy 标记的文件。 |
 | `janitor` | dns-clean + 杀所有可执行路径 == root copy zju-connect 的孤儿进程 + 删 pidfile。 |
 
+### 5.3 `uninstall --tun`(与 install 对称,交互 sudo 一次)
+
+1. 若 TUN 模式 daemon 在跑,先走 disconnect 流程(优雅停隧道 + 清 resolver)。
+2. 以 root 内联执行等价 janitor 的清理(删带标记 resolver 文件、杀孤儿 root zju-connect、删 pidfile)——**不依赖 helper 完好**,半残安装也能卸干净。
+3. 删 `/etc/sudoers.d/easy-proxy` 与整个 `/usr/local/libexec/easy-proxy/`。
+4. 幂等:未安装时逐项提示「不存在,跳过」,不报错。
+5. 不给 helper 加 uninstall 子命令:保持 NOPASSWD 命令面最小;卸载是人在场的稀有操作,交互输一次 sudo 密码可接受(与 install 对称)。
+
 ## 6. DNS:scoped resolver,不劫持全局
 
 config.yaml 新增(整段可缺省,`serde(default)`):
@@ -112,7 +120,7 @@ tun:
 ### 7.1 `connect --tun/-t`
 
 1. 既有前置检查照旧(foreign_proxy_name、已在线判断、config 校验)。
-2. TUN 就绪检查:helper 与 sudoers 已安装且 `sudo -n` 可用、root copy 与内嵌二进制版本一致;否则引导执行 `install --tun`(前台一次 sudo 密码)。
+2. TUN 就绪检查:helper 与 sudoers 已安装且 `sudo -n` 可用、root copy 与内嵌二进制版本一致。不满足则**交互询问**「TUN 组件未安装(或版本过旧),是否现在安装?需输入一次 sudo 密码」——确认即当场执行 `install --tun` 流程后继续 connect;拒绝则中止并提示可手动执行 `easy-proxy install --tun`;无 tty(自动化)场景不询问,直接报错退出。
 3. **janitor**(`sudo -n helper janitor`):清上次残留(resolver 文件、孤儿 root 隧道、pidfile)。
 4. 登录流程完全复用(密码 → 短信 → TWFID)。
 5. spawn 用户态 daemon(setsid),`ServeArgs` 加 `--tun`。
@@ -155,12 +163,12 @@ pub enum PortSeg { Num(u16), Tun }                        // 渲染「tun」
 
 | 文件 | 改动 |
 |---|---|
-| `src/lib.rs` | Connect 加 `--tun/-t`;connect/disconnect 的 tun 分支;胶囊调用适配 PortSeg |
+| `src/lib.rs` | Connect 加 `--tun/-t`;新增 Uninstall 子命令(`--tun`);connect/disconnect 的 tun 分支;胶囊调用适配 PortSeg |
 | `src/config.rs` | `TunConfig`、`RuntimeState.mode`(default Proxy) |
 | `src/capsule.rs` | `PortSeg` 枚举与「tun」渲染 |
 | `src/tunnel.rs` | spawn_daemon 透传 `--tun`;stop 路径 tun 分支(janitor 兜底替代 pkill);sudo/helper 调用封装 |
 | `src/daemon.rs` | `ServeArgs.tun`;启停走 helper;启动护栏;shutdown 序列(stop-tunnel → dns-clean);恢复路径适配 |
-| `src/install.rs` | `install --tun`;sudoers 写入 + visudo 校验;补全更新 |
+| `src/install.rs` | `install --tun` / `uninstall --tun`;sudoers 写入 + visudo 校验;补全更新(含 uninstall) |
 | `src/tun.rs`(新增) | helper 脚本内容常量、调用封装、janitor、参数校验、护栏解析 |
 | README / docs | TUN 模式说明、dns_suffixes 配置示例、验证方法(dscacheutil 而非 dig) |
 
@@ -201,13 +209,13 @@ pub enum PortSeg { Num(u16), Tun }                        // 渲染「tun」
 5. 与 clash verge(系统代理模式)共存无冲突;
 6. scoped resolver 用 `dscacheutil -q host` 验证内网/公网域名分流;Docker 容器内解析转发行为;
 7. 看门狗无人值守免密重启(sudo -n 无 tty 场景)端到端;
-8. 钥匙串在 daemon 静默重登路径无新增弹框(与 0.3.0 验证项合并)。
+8. 钥匙串在 daemon 静默重登路径无新增弹框(与 0.3.0 验证项合并);
+9. `uninstall --tun` 后三件套确实移除、resolver 干净,随后 `connect --tun` 能重新交互引导安装。
 
 ## 13. 风险与开放问题
 
 - **先决条件未证实**:服务端可能不下发 ipSet(护栏会拦住,但功能就无意义了)——真机验证项 1 先行。
 - **上游 experimental**:zju-connect TUN 标记为实验性;`-zju-dns-server auto` 与 `-tun-mode` 组合的行为以真机为准。
-- **sudoers 残留**:卸载路径(未来 `install --revert` 或文档手动步骤)需删 `/etc/sudoers.d/easy-proxy` 与 `/usr/local/libexec/easy-proxy`;本期先写进 README 手动清理说明。
 - **/var/run 语义**:重启后 pidfile 自动消失(tmpfs),与"utun 不跨重启"一致,无残留风险。
 
 ## 14. 版本
