@@ -77,6 +77,17 @@ fn sudo_password_prompt(action: &str) -> String {
     format!("{ANSI_BOLD_BLUE}›{ANSI_RESET} {action}需要 root, 请输入 sudo 密码: ")
 }
 
+/// 失败细节:优先取捕获的 stderr(visudo/install 的具体报错),空则退回退出码。
+fn sudo_failure_detail(out: &std::process::Output) -> String {
+    let detail = String::from_utf8_lossy(&out.stderr);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("(sudo 退出码 {})", out.status.code().unwrap_or(-1))
+    } else {
+        format!(": {detail}")
+    }
+}
+
 fn current_username() -> Result<String> {
     std::env::var("USER")
         .ok()
@@ -111,19 +122,21 @@ install -o root -g wheel -m 0755 "$3" "$1/zju-connect"
 visudo -cf "$4" >/dev/null
 install -o root -g wheel -m 0440 "$4" /etc/sudoers.d/easy-proxy
 "#;
-    let status = Command::new("/usr/bin/sudo")
+    // output() 捕获 stdout/stderr:失败细节(visudo/install 的报错)并进红叉行统一呈现,
+    // 不让原始 stderr 裸奔;sudo 的密码对话走 /dev/tty,不受捕获影响。
+    let out = Command::new("/usr/bin/sudo")
         .arg("-p").arg(sudo_password_prompt("安装 TUN 权限组件"))
         .arg("/bin/sh").arg("-c").arg(script).arg("sh")
         .arg(crate::tun::HELPER_DIR)
         .arg(&helper_tmp)
         .arg(&paths.zju_bin)
         .arg(&sudoers_tmp)
-        .status()
+        .output()
         .context("无法执行 sudo")?;
     let _ = fs::remove_file(&helper_tmp);
     let _ = fs::remove_file(&sudoers_tmp);
-    if !status.success() {
-        return Err(anyhow::anyhow!("TUN 组件安装失败(sudo 退出码 {})", status.code().unwrap_or(-1)));
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("TUN 组件安装失败{}", sudo_failure_detail(&out)));
     }
     // 自检:免密路径立即可用(顺带完成一次 janitor 清场)
     crate::tun::janitor().context("安装自检失败:sudo -n 免密调用 helper 不可用")?;
@@ -169,13 +182,13 @@ rm -f /etc/sudoers.d/easy-proxy
 rm -rf /usr/local/libexec/easy-proxy
 exit 0
 "##;
-    let status = Command::new("/usr/bin/sudo")
+    let out = Command::new("/usr/bin/sudo")
         .arg("-p").arg(sudo_password_prompt("卸载 TUN 权限组件"))
         .arg("/bin/sh").arg("-c").arg(script)
-        .status()
+        .output()
         .context("无法执行 sudo")?;
-    if !status.success() {
-        return Err(anyhow::anyhow!("卸载失败(sudo 退出码 {})", status.code().unwrap_or(-1)));
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("卸载失败{}", sudo_failure_detail(&out)));
     }
     println!(
         "{}",
