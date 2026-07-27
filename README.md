@@ -103,7 +103,7 @@ ep curl https://内网地址
 ep git pull
 ```
 
-`ep <cmd>` 在子 shell 里临时设置代理环境变量执行该命令，不影响当前 shell。未连接时会打印 status 并返回非零。
+`ep <cmd>` 在子 shell 里临时设置代理环境变量执行该命令，不影响当前 shell；内部走 `restart -f`，即使终端被其他代理工具接管（`proxy_name` 非 easy）也可用。未连接时会打印 status 并返回非零。
 
 ## 配置 `~/.config/easy-proxy/config.yaml`
 
