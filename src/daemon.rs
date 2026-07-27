@@ -688,7 +688,10 @@ async fn wait_socks_ready(paths: &Paths, child: &mut Child, timeout: Duration) -
                 tail(paths)
             ));
         }
-        let text = crate::config::read_tail_bytes(&paths.tunnel_log, 8192);
+        // 窗口须罩住整段启动日志:TUN 模式下 Client IP 与 SOCKS5 listening 之间隔着
+        // 服务端下发的全部 Add route 行(真机实测 613 条 ≈ 35KB),8KB 窗口会把 IP 冲出去
+        // 导致 tunnel_ip 解析为空;512KB 与护栏同窗,几千条网段也罩得住。
+        let text = crate::config::read_tail_bytes(&paths.tunnel_log, 512 * 1024);
         if text.contains("SOCKS5 server listening") {
             let ip = ip_re
                 .captures(&text)
@@ -753,6 +756,36 @@ mod tests {
     #[test]
     fn parse_vpn_dns_absent_is_none() {
         assert_eq!(parse_vpn_dns("SOCKS5 server listening on 127.0.0.1:1080"), None);
+    }
+
+    #[test]
+    fn ready_window_covers_tun_route_burst() {
+        // TUN 模式真机形状:Client IP 与 SOCKS5 listening 之间隔着服务端下发的全部
+        // Add route 行(实测 613 条,这里放 2000 条加压)。就绪窗口必须罩住整段,
+        // 否则 tunnel_ip 被冲出窗口解析为空——2.0.0 真机踩过的坑。
+        let mut log = String::from(
+            "2026/07/27 20:02:12 Client IP: 2.0.1.24\n\
+             2026/07/27 20:02:12 Use DNS server 10.0.104.104 provided by server\n",
+        );
+        for i in 0..2000 {
+            log.push_str(&format!(
+                "2026/07/27 20:02:12 Add route to 10.{}.{}.0/24\n",
+                i / 256,
+                i % 256
+            ));
+        }
+        log.push_str("2026/07/27 20:02:13 SOCKS5 server listening on 127.0.0.1:1080\n");
+        let p = std::env::temp_dir().join(format!("ep_ready_window_{}.log", std::process::id()));
+        std::fs::write(&p, &log).unwrap();
+        let text = crate::config::read_tail_bytes(&p, 512 * 1024);
+        let _ = std::fs::remove_file(&p);
+        assert!(text.contains("SOCKS5 server listening"));
+        let ip = Regex::new(r"Client IP:\s*([\d.]+)")
+            .unwrap()
+            .captures(&text)
+            .map(|c| c[1].to_string());
+        assert_eq!(ip.as_deref(), Some("2.0.1.24"));
+        assert_eq!(parse_vpn_dns(&text), Some("10.0.104.104".to_string()));
     }
 
     #[test]
