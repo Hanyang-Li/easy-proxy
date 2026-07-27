@@ -164,6 +164,7 @@ _easy-proxy() {
     args)
       case "$words[1]" in
         connect) _arguments '--relogin[忽略钥匙串密码，强制重新输入]' ;;
+        stop|restart) _arguments '(-f --force)'{-f,--force}'[proxy_name 非 easy 时也强制执行]' ;;
       esac
       ;;
   esac

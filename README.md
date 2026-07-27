@@ -84,8 +84,8 @@ mv ~/.config/easy-proxy/scripts ~/.local/share/easy-proxy/scripts   # 如果配�
 easy-proxy connect       # 登录并启动隧道后台守护（跨终端）。交互输入短信验证码；成功后显示延迟+端口胶囊
 easy-proxy disconnect    # 停止后台守护 + 保活，并清除当前终端的代理环境变量
 easy-proxy start         # 为当前终端设置代理环境变量（http_proxy/https_proxy/all_proxy）
-easy-proxy stop          # 移除当前终端代理环境变量
-easy-proxy restart       # 重新读取端口并更新当前终端代理环境变量
+easy-proxy stop          # 移除当前终端代理环境变量（-f/--force：proxy_name 非 easy 时也强制执行）
+easy-proxy restart       # 重新读取端口并更新当前终端代理环境变量（-f/--force 同上）
 easy-proxy status        # 状态胶囊：online/offline · 延迟 · 端口
 easy-proxy port          # 只输出端口号
 easy-proxy install       # 配置 .zshrc / 补全 / 默认配置 / 释放 zju-connect
