@@ -13,6 +13,7 @@ mod keychain;
 mod login;
 mod recover;
 mod sms;
+mod tun;
 mod tunnel;
 
 use capsule::{
