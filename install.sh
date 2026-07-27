@@ -131,13 +131,15 @@ command -v curl >/dev/null 2>&1 || fail "需要 curl"
 command -v shasum >/dev/null 2>&1 || fail "需要 shasum"
 
 # --- 解析版本与下载地址 ---
+# 用 releases/latest 的网页重定向取 tag，不走 api.github.com——
+# 匿名 API 每 IP 每小时仅 60 次，公司出口 NAT 下极易被打光（403）
 if [ -n "${VERSION:-}" ]; then
   tag="$VERSION"
 else
-  tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
-    sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+  tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" |
+    sed 's|.*/tag/||')
 fi
-[ -n "$tag" ] || fail "无法获取最新版本号，可设置 VERSION=v1.0.0 后重试"
+[ -n "$tag" ] || fail "无法获取最新版本号，可设置 VERSION=v2.0.0 后重试"
 
 base="https://github.com/$REPO/releases/download/$tag"
 
