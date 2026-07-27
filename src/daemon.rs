@@ -58,6 +58,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     let pid = std::process::id() as i32;
     let mut state = RuntimeState {
         phase: crate::config::Phase::Reconnecting,
+        mode: crate::config::Mode::Proxy,
         daemon_pid: pid,
         port: args.mixed_port,
         socks_upstream: args.socks.clone(),

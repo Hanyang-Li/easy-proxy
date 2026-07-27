@@ -45,6 +45,28 @@ impl PromptConfig {
     }
 }
 
+/// TUN 透明模式配置(config.yaml `tun:` 段,整段可缺省)。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TunConfig {
+    /// 内网专用域名后缀:隧道就绪后写成 /etc/resolver/<suffix> scoped resolver,
+    /// nameserver 指服务端下发的 VPN DNS。默认空 = 不写任何 resolver 文件。
+    #[serde(default)]
+    pub dns_suffixes: Vec<String>,
+}
+
+/// 连接模式:Proxy=现有纯代理;Tun=分流透明模式(root 隧道 + scoped resolver)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    Proxy,
+    Tun,
+}
+
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::Proxy
+    }
+}
+
 /// ~/.config/easy-proxy/config.yaml
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -79,6 +101,9 @@ pub struct AppConfig {
     /// 静默重登最小间隔(秒)。按上次发码时刻算,限流下一次「自动」重登;手动 connect 不受限。
     #[serde(default = "default_silent_relogin_interval")]
     pub silent_relogin_interval: u64,
+    /// TUN 透明模式配置(仅 connect --tun 时使用)。
+    #[serde(default)]
+    pub tun: TunConfig,
 }
 
 fn default_https_port() -> u16 {
@@ -117,6 +142,7 @@ impl Default for AppConfig {
             healthcheck_interval: 60,
             healthcheck_fail_threshold: 2,
             silent_relogin_interval: 3600,
+            tun: TunConfig::default(),
         }
     }
 }
@@ -165,6 +191,9 @@ pub fn read_tail_bytes(path: &std::path::Path, max: usize) -> String {
 pub struct RuntimeState {
     #[serde(default)]
     pub phase: Phase,
+    /// 本次连接的模式;旧 state.json 无此字段,默认 Proxy。
+    #[serde(default)]
+    pub mode: Mode,
     pub daemon_pid: i32,
     pub port: u16,
     pub socks_upstream: String,
@@ -273,6 +302,7 @@ mod tests {
     fn runtime_state_roundtrip_and_legacy_compat() {
         let st = RuntimeState {
             phase: Phase::Online,
+            mode: Mode::Proxy,
             daemon_pid: 42,
             port: 7899,
             socks_upstream: "127.0.0.1:1080".into(),
@@ -294,6 +324,31 @@ mod tests {
         assert_eq!(parsed.phase, Phase::Reconnecting);
         assert_eq!(parsed.last_sms_sent, None);
         assert_eq!(parsed.vpn_dns, None);
+    }
+
+    #[test]
+    fn tun_config_defaults_empty_and_parses() {
+        // 整段缺省
+        let c: AppConfig = serde_yaml::from_str("server: s\nusername: u\n").unwrap();
+        assert!(c.tun.dns_suffixes.is_empty());
+        // 显式配置
+        let c: AppConfig =
+            serde_yaml::from_str("server: s\nusername: u\ntun:\n  dns_suffixes: [\"a.b\"]\n").unwrap();
+        assert_eq!(c.tun.dns_suffixes, vec!["a.b".to_string()]);
+    }
+
+    #[test]
+    fn mode_default_is_proxy_and_legacy_state_compat() {
+        assert_eq!(Mode::default(), Mode::Proxy);
+        // 旧 state.json(无 mode 字段)解析后 mode 落 Proxy
+        let legacy = r#"{"phase":"Online","daemon_pid":1,"port":7899,"socks_upstream":"a","http_upstream":"b","server":"s","tunnel_ip":"","error":null}"#;
+        let st: RuntimeState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(st.mode, Mode::Proxy);
+        // round-trip
+        let mut st2 = st.clone();
+        st2.mode = Mode::Tun;
+        let back: RuntimeState = serde_json::from_str(&serde_json::to_string(&st2).unwrap()).unwrap();
+        assert_eq!(back.mode, Mode::Tun);
     }
 
     #[test]
