@@ -287,6 +287,7 @@ _easy-proxy() {
     args)
       case "$words[1]" in
         connect) _arguments '--relogin[忽略钥匙串密码，强制重新输入]' '(-t --tun)'{-t,--tun}'[以 TUN 透明模式连接]' ;;
+        stop|restart) _arguments '(-f --force)'{-f,--force}'[proxy_name 非 easy 时也强制执行]' ;;
         install) _arguments '--tun[安装 TUN 权限组件(需一次 sudo)]' ;;
         uninstall) _arguments '--tun[卸载 TUN 权限组件(需一次 sudo)]' ;;
       esac
@@ -338,7 +339,7 @@ ep() {{
     return 1
   fi
   (
-    eval "$(COLUMNS=${{COLUMNS:-80}} "{exe}" restart)" >&2 || exit
+    eval "$(COLUMNS=${{COLUMNS:-80}} "{exe}" restart -f)" >&2 || exit
     if [[ -n ${{aliases[$1]}} ]]; then
       eval "${{aliases[$1]}} ${{(j: :)${{(@q)@[2,-1]}}}}"
     else
@@ -424,6 +425,7 @@ mod tests {
         assert!(block.contains("ep() {"));
         assert!(block.contains(r#""/usr/local/bin/easy-proxy" port --connected >/dev/null 2>&1"#));
         assert!(block.contains(r#""/usr/local/bin/easy-proxy" status >&2"#));
-        assert!(block.contains(r#"eval "$(COLUMNS=${COLUMNS:-80} "/usr/local/bin/easy-proxy" restart)" >&2 || exit"#));
+        // ep 在子 shell 里拿代理变量,不影响外层环境,故被其他代理接管时也强制执行
+        assert!(block.contains(r#"eval "$(COLUMNS=${COLUMNS:-80} "/usr/local/bin/easy-proxy" restart -f)" >&2 || exit"#));
     }
 }

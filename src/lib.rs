@@ -45,9 +45,17 @@ enum Commands {
     /// 为当前终端设置代理环境变量
     Start,
     /// 移除当前终端代理环境变量
-    Stop,
+    Stop {
+        /// proxy_name 非 easy（终端被其他代理工具接管）时也强制执行
+        #[arg(short, long)]
+        force: bool,
+    },
     /// 重新读取端口并更新当前终端代理环境变量
-    Restart,
+    Restart {
+        /// proxy_name 非 easy（终端被其他代理工具接管）时也强制执行
+        #[arg(short, long)]
+        force: bool,
+    },
     /// 显示连接状态胶囊（online/offline · 延迟 · 端口）
     Status,
     /// 只输出当前端口号
@@ -94,8 +102,8 @@ pub fn run() -> Result<()> {
         Commands::Connect { relogin, tun } => cmd_connect(&paths, &cfg, relogin, tun),
         Commands::Disconnect => cmd_disconnect(&paths, &cfg),
         Commands::Start => cmd_start(&paths, &cfg),
-        Commands::Stop => cmd_stop(&cfg),
-        Commands::Restart => cmd_restart(&paths, &cfg),
+        Commands::Stop { force } => cmd_stop(&cfg, force),
+        Commands::Restart { force } => cmd_restart(&paths, &cfg, force),
         Commands::Status => cmd_status(&paths, &cfg),
         Commands::Port { connected } => cmd_port(&paths, &cfg, connected),
         Commands::Install { .. } | Commands::Uninstall { .. } | Commands::Serve(_) => unreachable!(),
@@ -700,10 +708,15 @@ fn cmd_start(paths: &Paths, cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stop(cfg: &AppConfig) -> Result<()> {
-    if let Some(name) = foreign_proxy_name() {
-        emit_shell_error(&format!("proxy_name 当前为 {name}，非 easy，拒绝操作"), cfg);
-        return Ok(());
+fn cmd_stop(cfg: &AppConfig, force: bool) -> Result<()> {
+    if !force {
+        if let Some(name) = foreign_proxy_name() {
+            emit_shell_error(
+                &format!("proxy_name 当前为 {name}，非 easy，拒绝操作（--force 可强制执行）"),
+                cfg,
+            );
+            return Ok(());
+        }
     }
     println!("unset http_proxy https_proxy all_proxy no_proxy CORP_PROXY proxy_name");
     // 不带状态胶囊:stop 只清当前终端的环境变量,daemon 仍在运行,显示 offline 会误导
@@ -714,10 +727,15 @@ fn cmd_stop(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn cmd_restart(paths: &Paths, cfg: &AppConfig) -> Result<()> {
-    if let Some(name) = foreign_proxy_name() {
-        emit_shell_error(&format!("proxy_name 当前为 {name}，非 easy，拒绝操作"), cfg);
-        return Ok(());
+fn cmd_restart(paths: &Paths, cfg: &AppConfig, force: bool) -> Result<()> {
+    if !force {
+        if let Some(name) = foreign_proxy_name() {
+            emit_shell_error(
+                &format!("proxy_name 当前为 {name}，非 easy，拒绝操作（--force 可强制执行）"),
+                cfg,
+            );
+            return Ok(());
+        }
     }
     let Some(st) = connected_state(paths) else {
         emit_shell_error("未连接，请先执行 easy-proxy connect", cfg);
@@ -806,6 +824,38 @@ fn cmd_port(paths: &Paths, cfg: &AppConfig, connected_only: bool) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_and_restart_accept_force_flag() {
+        for (args, expect) in [
+            (vec!["easy-proxy", "stop"], false),
+            (vec!["easy-proxy", "stop", "-f"], true),
+            (vec!["easy-proxy", "stop", "--force"], true),
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("stop 参数应能解析");
+            let Commands::Stop { force } = cli.command else {
+                panic!("应解析为 Stop");
+            };
+            assert_eq!(force, expect, "args: {args:?}");
+        }
+        for (args, expect) in [
+            (vec!["easy-proxy", "restart"], false),
+            (vec!["easy-proxy", "restart", "-f"], true),
+            (vec!["easy-proxy", "restart", "--force"], true),
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("restart 参数应能解析");
+            let Commands::Restart { force } = cli.command else {
+                panic!("应解析为 Restart");
+            };
+            assert_eq!(force, expect, "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn start_rejects_force_flag() {
+        // start 保持严格:被接管的终端里覆盖别家代理变量没有合理场景
+        assert!(Cli::try_parse_from(["easy-proxy", "start", "--force"]).is_err());
+    }
 
     #[test]
     fn spinner_frame_cycles() {

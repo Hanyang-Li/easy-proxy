@@ -220,4 +220,5 @@ pub enum PortSeg { Num(u16), Tun }                        // 渲染「tun」
 
 ## 14. 版本
 
-本特性作为 **1.1.0** 发布(新增 CLI flag、config 段、state 字段、root helper 与安装流程)。
+本特性作为 **2.0.0** 发布(新增 CLI flag、config 段、state 字段、root helper 与安装流程;
+1.1.x 已被 stop/restart --force 特性占用,且引入系统级组件属大变更,升大版本)。
