@@ -17,7 +17,7 @@ mod tunnel;
 
 use capsule::{
     error_line, format_capsule, info_line, shell_single_quote, success_line, terminal_width,
-    ConnState, Delay, ProxyStatus,
+    ConnState, Delay, PortSeg, ProxyStatus,
 };
 use config::{AppConfig, Paths};
 
@@ -669,7 +669,8 @@ fn emit_exports(port: u16, cfg: &AppConfig, message: &str) {
     println!("export no_proxy=localhost,127.0.0.1");
     println!("export CORP_PROXY=http://127.0.0.1:{port}");
     println!("export proxy_name=easy");
-    let status = ProxyStatus { state: ConnState::Online, delay: Delay::Hidden, port: Some(port) };
+    let status =
+        ProxyStatus { state: ConnState::Online, delay: Delay::Hidden, port: Some(PortSeg::Num(port)) };
     println!(
         "echo {}",
         shell_single_quote(&success_line(message, Some(&status), &cfg.prompt))
@@ -697,7 +698,7 @@ fn cmd_status(paths: &Paths, cfg: &AppConfig) -> Result<()> {
 /// 胶囊显示决策(纯函数):phase=Online 且探针通 → online+延迟;phase=Online 但探针不通 →
 /// reconnecting(看门狗还没攒够失败阈值,抢先如实反映「不可用但会自愈」,不显示延迟段);
 /// phase=Reconnecting → reconnecting。reconnecting 一律隐藏延迟段、保留端口段。
-fn capsule_from(phase: config::Phase, probe: Delay, port: u16) -> ProxyStatus {
+fn capsule_from(phase: config::Phase, probe: Delay, port: PortSeg) -> ProxyStatus {
     match (phase, probe) {
         (config::Phase::Online, Delay::Timeout) | (config::Phase::Reconnecting, _) => ProxyStatus {
             state: ConnState::Reconnecting,
@@ -719,7 +720,8 @@ fn runtime_capsule(st: &config::RuntimeState) -> ProxyStatus {
     } else {
         Delay::Hidden
     };
-    capsule_from(st.phase, probe, st.port)
+    let port = if st.mode == config::Mode::Tun { PortSeg::Tun } else { PortSeg::Num(st.port) };
+    capsule_from(st.phase, probe, port)
 }
 
 fn cmd_port(paths: &Paths, cfg: &AppConfig, connected_only: bool) -> Result<()> {
@@ -760,26 +762,32 @@ mod tests {
 
     #[test]
     fn capsule_online_with_probe_alive_shows_delay() {
-        let c = capsule_from(config::Phase::Online, Delay::Value(42), 7899);
+        let c = capsule_from(config::Phase::Online, Delay::Value(42), PortSeg::Num(7899));
         assert_eq!(c.state, ConnState::Online);
         assert_eq!(c.delay, Delay::Value(42));
-        assert_eq!(c.port, Some(7899));
+        assert_eq!(c.port, Some(PortSeg::Num(7899)));
     }
 
     #[test]
     fn capsule_online_but_probe_dead_shows_reconnecting_without_delay() {
         // 切网后、看门狗未达阈值:phase 仍 Online 但探针 timeout → 黄胶囊,无延迟段
-        let c = capsule_from(config::Phase::Online, Delay::Timeout, 7899);
+        let c = capsule_from(config::Phase::Online, Delay::Timeout, PortSeg::Num(7899));
         assert_eq!(c.state, ConnState::Reconnecting);
         assert_eq!(c.delay, Delay::Hidden);
-        assert_eq!(c.port, Some(7899));
+        assert_eq!(c.port, Some(PortSeg::Num(7899)));
     }
 
     #[test]
     fn capsule_reconnecting_phase_never_shows_delay() {
-        let c = capsule_from(config::Phase::Reconnecting, Delay::Value(10), 7899);
+        let c = capsule_from(config::Phase::Reconnecting, Delay::Value(10), PortSeg::Num(7899));
         assert_eq!(c.state, ConnState::Reconnecting);
         assert_eq!(c.delay, Delay::Hidden);
+    }
+
+    #[test]
+    fn capsule_tun_mode_shows_tun_segment() {
+        let c = capsule_from(config::Phase::Online, Delay::Value(5), PortSeg::Tun);
+        assert_eq!(c.port, Some(PortSeg::Tun));
     }
 }
 

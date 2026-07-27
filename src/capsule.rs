@@ -35,11 +35,18 @@ pub enum ConnState {
     Offline,
 }
 
+/// 胶囊 port 段内容:Proxy 模式显示端口号,TUN 模式显示「tun」表明透明模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSeg {
+    Num(u16),
+    Tun,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyStatus {
     pub state: ConnState,
     pub delay: Delay,
-    pub port: Option<u16>,
+    pub port: Option<PortSeg>,
 }
 
 #[derive(Clone)]
@@ -100,7 +107,11 @@ fn segments(status: &ProxyStatus, prompt: &PromptConfig) -> Vec<Segment> {
         Delay::Timeout => out.push(Segment::new(prompt.delay(), "timeout".to_string(), COLOR_DELAY)),
     }
     if let Some(port) = status.port {
-        out.push(Segment::new(prompt.port(), port.to_string(), COLOR_PORT));
+        let value = match port {
+            PortSeg::Num(n) => n.to_string(),
+            PortSeg::Tun => "tun".to_string(),
+        };
+        out.push(Segment::new(prompt.port(), value, COLOR_PORT));
     }
     out
 }
@@ -315,12 +326,25 @@ mod tests {
     }
 
     #[test]
+    fn tun_port_segment_renders_tun() {
+        let p = PromptConfig::default();
+        let st = ProxyStatus {
+            state: ConnState::Online,
+            delay: Delay::Value(12),
+            port: Some(PortSeg::Tun),
+        };
+        let segs = segments(&st, &p);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[2].value, "tun");
+    }
+
+    #[test]
     fn reconnecting_state_renders_yellow_first_segment() {
         let p = PromptConfig::default();
         let st = ProxyStatus {
             state: ConnState::Reconnecting,
             delay: Delay::Hidden,
-            port: Some(7899),
+            port: Some(PortSeg::Num(7899)),
         };
         let segs = segments(&st, &p);
         assert_eq!(segs[0].value, "reconnecting");
@@ -334,7 +358,7 @@ mod tests {
     fn online_and_offline_states_unchanged() {
         let p = PromptConfig::default();
         let on = segments(
-            &ProxyStatus { state: ConnState::Online, delay: Delay::Value(42), port: Some(7899) },
+            &ProxyStatus { state: ConnState::Online, delay: Delay::Value(42), port: Some(PortSeg::Num(7899)) },
             &p,
         );
         assert_eq!(on[0].value, "online");
