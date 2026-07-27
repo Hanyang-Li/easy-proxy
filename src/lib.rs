@@ -54,7 +54,17 @@ enum Commands {
         connected: bool,
     },
     /// 安装 .zshrc wrapper、tab 补全与默认配置
-    Install,
+    Install {
+        /// 同时安装 TUN 权限组件(root helper + sudoers,需一次 sudo 密码)
+        #[arg(long)]
+        tun: bool,
+    },
+    /// 卸载 TUN 权限组件(helper / root copy / sudoers,需一次 sudo 密码)
+    Uninstall {
+        /// 目前仅支持 --tun
+        #[arg(long)]
+        tun: bool,
+    },
     /// 内部：后台守护进程（拉起 zju-connect + 混合端口代理）
     #[command(hide = true, name = "__serve")]
     Serve(daemon::ServeArgs),
@@ -69,8 +79,11 @@ pub fn run() -> Result<()> {
         let cfg = paths.read_app_config()?;
         return daemon::serve(args.clone(), cfg, &paths);
     }
-    if let Commands::Install = &cli.command {
-        return install::cmd_install(&paths);
+    if let Commands::Install { tun } = &cli.command {
+        return install::cmd_install(&paths, *tun);
+    }
+    if let Commands::Uninstall { tun } = &cli.command {
+        return install::cmd_uninstall(&paths, *tun);
     }
 
     let cfg = paths.read_app_config()?;
@@ -82,7 +95,7 @@ pub fn run() -> Result<()> {
         Commands::Restart => cmd_restart(&paths, &cfg),
         Commands::Status => cmd_status(&paths, &cfg),
         Commands::Port { connected } => cmd_port(&paths, &cfg, connected),
-        Commands::Install | Commands::Serve(_) => unreachable!(),
+        Commands::Install { .. } | Commands::Uninstall { .. } | Commands::Serve(_) => unreachable!(),
     }
 }
 
