@@ -86,9 +86,10 @@ easy-proxy disconnect    # 停止后台守护 + 保活，并清除当前终端�
 easy-proxy start         # 为当前终端设置代理环境变量（http_proxy/https_proxy/all_proxy）
 easy-proxy stop          # 移除当前终端代理环境变量
 easy-proxy restart       # 重新读取端口并更新当前终端代理环境变量
-easy-proxy status        # 状态胶囊：online/offline · 延迟 · 端口
+easy-proxy status        # 状态胶囊：online/offline · 延迟 · 端口（TUN 模式端口段显示 tun）
 easy-proxy port          # 只输出端口号
-easy-proxy install       # 配置 .zshrc / 补全 / 默认配置 / 释放 zju-connect
+easy-proxy install       # 配置 .zshrc / 补全 / 默认配置 / 释放 zju-connect（--tun 加装 TUN 权限组件）
+easy-proxy uninstall --tun  # 卸载 TUN 权限组件（幂等，清理 resolver 残留与孤儿隧道）
 ```
 
 - `connect`/`disconnect` 控制的是**跨终端**的后台守护进程（连接服务本身）。
@@ -105,6 +106,31 @@ ep git pull
 
 `ep <cmd>` 在子 shell 里临时设置代理环境变量执行该命令，不影响当前 shell。未连接时会打印 status 并返回非零。
 
+## TUN 透明模式（macOS）
+
+`connect --tun`（或 `-t`）以**分流 TUN 模式**连接：服务端下发的内网网段直接走 utun 虚拟网卡，
+配置的内网域名后缀由 VPN DNS 分流解析（/etc/resolver scoped resolver），浏览器 / ssh 等
+无需配置代理即可直访内网。mixed 7899 与 `start/stop/restart` 语义完全不变——TUN 是额外的
+透明层，不是替代代理层。
+
+- **首次使用**需 `easy-proxy install --tun`（一次 sudo 密码，安装 root helper 与 sudoers 免密规则；
+  `connect --tun` 检测到未安装会交互引导当场安装）。easy-proxy 升级后需重跑一次以刷新 root 副本。
+- **卸载**：`easy-proxy uninstall --tun`（删除 `/usr/local/libexec/easy-proxy/` 与
+  `/etc/sudoers.d/easy-proxy`，清理 resolver 残留与孤儿隧道，幂等）。
+- **域名分流**（可选）在 config.yaml 配置内网专用后缀：
+
+  ```yaml
+  tun:
+    dns_suffixes: ["corp.example.com"]
+  ```
+
+- **安全边界**：全程不改默认路由、不改全局 DNS（不用 dns-hijack）；utun 与分流路由由内核随进程
+  消亡自动清理。任何异常退出（kill -9 / 断电）都不破坏公网网络，残留 resolver 文件只影响所配后缀、
+  下次 connect/disconnect 时自动清理。
+- **验证域名分流**用 `dscacheutil -q host -a name 内网域名` 或直接 ping；`dig`/`nslookup`
+  自己直连 DNS 服务器、不走系统解析器，会误判「没生效」。
+- 看门狗、路由事件秒级检测、分级恢复在 TUN 模式下原样生效，无人值守重启隧道免密（sudoers NOPASSWD）。
+
 ## 配置 `~/.config/easy-proxy/config.yaml`
 
 ```yaml
@@ -116,6 +142,8 @@ mixed_port: 7899          # 本机对外暴露的混合端口（避开 clash ver
 healthcheck_interval: 60         # 兜底心跳（秒）：切网、唤醒由路由事件秒级触发探测，此周期只是兜底
 healthcheck_fail_threshold: 2    # 连续探测失败几次判定断线（躲开单次抖动）
 silent_relogin_interval: 3600    # 静默重登最小间隔（秒），按上次发码时刻限流下一次自动重登
+# tun:                           # TUN 透明模式（connect --tun)专用，见「TUN 透明模式」
+#   dns_suffixes: ["corp.example.com"]
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"
