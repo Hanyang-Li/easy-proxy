@@ -36,6 +36,9 @@ enum Commands {
         /// 忽略钥匙串中已存密码，强制重新输入
         #[arg(long)]
         relogin: bool,
+        /// TUN 透明模式:内网网段免代理直达、内网域名分流解析(需先 install --tun)
+        #[arg(long, short = 't')]
+        tun: bool,
     },
     /// 停止隧道后台守护，并清除当前终端代理环境变量
     Disconnect,
@@ -88,7 +91,7 @@ pub fn run() -> Result<()> {
 
     let cfg = paths.read_app_config()?;
     match cli.command {
-        Commands::Connect { relogin } => cmd_connect(&paths, &cfg, relogin),
+        Commands::Connect { relogin, tun } => cmd_connect(&paths, &cfg, relogin, tun),
         Commands::Disconnect => cmd_disconnect(&paths, &cfg),
         Commands::Start => cmd_start(&paths, &cfg),
         Commands::Stop => cmd_stop(&cfg),
@@ -506,7 +509,34 @@ fn automation_via_file(cfg: &AppConfig, jar: &Path, path: &str) -> Result<String
     Err(anyhow!("[自动化] 验证码连续 {FILE_ATTEMPTS} 次被拒"))
 }
 
-fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
+/// TUN 就绪检查(spec §7.1 第 2 步):组件缺失/过旧时交互引导当场安装;
+/// 无 tty(自动化)不询问,直接报错退出。
+fn ensure_tun_ready(paths: &Paths) -> Result<()> {
+    let readiness = tun::check_ready(paths);
+    if readiness == tun::Readiness::Ready {
+        return Ok(());
+    }
+    let what = match readiness {
+        tun::Readiness::NotInstalled => "TUN 组件未安装",
+        _ => "TUN 组件版本过旧",
+    };
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!("{what},请先执行 easy-proxy install --tun"));
+    }
+    let yes = prompt_or_exit(
+        dialoguer::Confirm::with_theme(&ep_theme())
+            .with_prompt(format!("{what},现在安装吗?(需输入一次 sudo 密码)"))
+            .default(true)
+            .interact(),
+    )?;
+    if !yes {
+        return Err(anyhow!("已取消。可稍后手动执行 easy-proxy install --tun"));
+    }
+    install::install_tun(paths)?;
+    Ok(())
+}
+
+fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) -> Result<()> {
     // 进入交互(密码 / 取码含 raw 模式)前装好 Ctrl-C 处理:全程可即时干净退出、不残留终端状态。
     install_sigint_handler();
     if cfg.server.trim().is_empty() || cfg.username.trim().is_empty() {
@@ -520,6 +550,22 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     if let Some(st) = paths.read_state() {
         if tunnel::pid_alive(st.daemon_pid) {
             if st.phase == config::Phase::Online {
+                // 双模式互斥:已有另一模式的连接时不静默复用,提示先 disconnect
+                let running_tun = st.mode == config::Mode::Tun;
+                if running_tun != tun_mode {
+                    println!(
+                        "{}",
+                        info_line(
+                            &format!(
+                                "已有{}模式连接,如需切换请先 easy-proxy disconnect",
+                                if running_tun { " TUN " } else { "代理" }
+                            ),
+                            Some(&runtime_capsule(&st)),
+                            &cfg.prompt,
+                        )
+                    );
+                    return Ok(());
+                }
                 let status = runtime_capsule(&st);
                 if status.state == ConnState::Online {
                     println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
@@ -541,6 +587,11 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     }
 
     install::ensure_zju_bin(paths)?;
+    if tun_mode {
+        ensure_tun_ready(paths)?;
+        // 清上次残留:resolver 文件、孤儿 root 隧道、pidfile(spec §7.1 第 3 步)
+        tun::janitor()?;
+    }
     std::fs::create_dir_all(&paths.state_dir)?; // 登录 cookie / 状态 / 日志的落脚处
 
     let jar = paths.cookies.clone();
@@ -587,7 +638,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool) -> Result<()> {
     };
     let _ = std::fs::remove_file(&jar);
 
-    tunnel::spawn_daemon(paths, cfg, &twfid, last_sms.get(), false)?;
+    tunnel::spawn_daemon(paths, cfg, &twfid, last_sms.get(), tun_mode)?;
     // 「连接中…」进度行：覆盖「建隧道就绪」+「延迟探测」整段（否则探测那几秒静默像假死），
     // 到最后一刻才清行、让 stdout 的「已连接」胶囊接上。
     let line = StatusLine::new();
