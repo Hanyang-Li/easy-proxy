@@ -181,6 +181,68 @@ pub fn default_route_is_utun(route_get_output: &str) -> bool {
         .any(|v| v.trim().starts_with("utun"))
 }
 
+/// 从 `scutil --dns` 输出解析默认(非 scoped)DNS 的首个 IPv4 nameserver。
+/// 只看主段(「DNS configuration (for scoped queries)」之前),跳过带 domain 的块
+/// (mdns 与 /etc/resolver 派生的都带 domain);拿不到返回 None。
+pub fn parse_default_dns(scutil_out: &str) -> Option<String> {
+    let mut in_domain_block = false;
+    for line in scutil_out.lines() {
+        let t = line.trim();
+        if t.starts_with("DNS configuration (for scoped queries)") {
+            return None;
+        }
+        if t.starts_with("resolver #") {
+            in_domain_block = false;
+            continue;
+        }
+        // 块首的 domain 行(mdns / etc-resolver 派生块);「search domain[0]」不算
+        if t.starts_with("domain") {
+            in_domain_block = true;
+            continue;
+        }
+        if in_domain_block {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("nameserver[") {
+            if let Some(ip) = rest.splitn(2, ':').nth(1).map(str::trim) {
+                if valid_ipv4(ip) {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 抓当前系统默认 DNS 快照(供网关域名豁免 resolver 用)。
+pub fn system_dns_v4() -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/scutil").arg("--dns").output().ok()?;
+    parse_default_dns(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// 组装 dns-sync 的 `name=ip` 参数列表:各 suffix → vpn_dns,末尾追加网关域名豁免
+/// (server → 系统 DNS 快照)。豁免必须排最后:与 suffix 同名相撞时后写者赢,保重连。
+/// server 为纯 IP / 快照缺失 / suffixes 为空(无毒可解)时不写豁免。
+pub fn dns_sync_pairs(
+    suffixes: &[&str],
+    vpn_dns: &str,
+    server: &str,
+    sys_dns: Option<&str>,
+) -> Vec<String> {
+    if suffixes.is_empty() {
+        return Vec::new();
+    }
+    let mut pairs: Vec<String> = suffixes.iter().map(|s| format!("{s}={vpn_dns}")).collect();
+    // 豁免值必须过 helper 的同款白名单——一个坏 pair 会让整次 dns-sync 连 suffix 一起失败
+    let server = server.to_ascii_lowercase();
+    if let Some(dns) = sys_dns {
+        if valid_suffix(&server) && !valid_ipv4(&server) && valid_ipv4(dns) {
+            pairs.push(format!("{server}={dns}"));
+        }
+    }
+    pairs
+}
+
 /// 组一条 `sudo -n <helper> <args...>` 命令(-n:免密不可用立即失败,绝不挂在密码提示上)。
 pub fn sudo_helper(args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new("/usr/bin/sudo");
@@ -285,6 +347,131 @@ mod tests {
         assert!(default_route_is_utun(utun));
         assert!(!default_route_is_utun(wifi));
         assert!(!default_route_is_utun("")); // 拿不到输出不误报
+    }
+
+    /// 真机 scutil --dns 形状(2026-07-28 抓取):resolver #1 无 domain 行,后续 mdns 块都有。
+    const SCUTIL_REAL: &str = "DNS configuration\n\
+\n\
+resolver #1\n\
+  nameserver[0] : 114.114.114.114\n\
+  flags    : Request A records\n\
+  reach    : 0x00000002 (Reachable)\n\
+\n\
+resolver #2\n\
+  domain   : local\n\
+  options  : mdns\n\
+  timeout  : 5\n\
+  flags    : Request A records\n\
+  reach    : 0x00000000 (Not Reachable)\n\
+  order    : 300000\n";
+
+    #[test]
+    fn parse_default_dns_real_shape() {
+        assert_eq!(parse_default_dns(SCUTIL_REAL), Some("114.114.114.114".to_string()));
+    }
+
+    #[test]
+    fn parse_default_dns_search_domain_line_is_not_domain() {
+        // DHCP 网络下 resolver #1 常带 search domain[0] 行——不能误认成 domain 块跳过
+        let out = "DNS configuration\n\
+\n\
+resolver #1\n\
+  search domain[0] : lan\n\
+  nameserver[0] : 192.168.31.1\n\
+  if_index : 14 (en0)\n";
+        assert_eq!(parse_default_dns(out), Some("192.168.31.1".to_string()));
+    }
+
+    #[test]
+    fn parse_default_dns_skips_domain_scoped_blocks() {
+        // 带 domain 的块(/etc/resolver 派生、mdns)一律跳过,即使排在前面
+        let out = "DNS configuration\n\
+\n\
+resolver #1\n\
+  domain   : yangqianguan.com\n\
+  nameserver[0] : 10.0.104.104\n\
+\n\
+resolver #2\n\
+  nameserver[0] : 114.114.114.114\n";
+        assert_eq!(parse_default_dns(out), Some("114.114.114.114".to_string()));
+    }
+
+    #[test]
+    fn parse_default_dns_prefers_ipv4_within_block() {
+        let out = "resolver #1\n\
+  nameserver[0] : fe80::1\n\
+  nameserver[1] : 223.5.5.5\n";
+        assert_eq!(parse_default_dns(out), Some("223.5.5.5".to_string()));
+    }
+
+    #[test]
+    fn parse_default_dns_ignores_scoped_queries_section() {
+        // 主段没有可用 IPv4 → None;不去 scoped queries 段捡(那是 per-interface 配置)
+        let out = "DNS configuration\n\
+\n\
+resolver #1\n\
+  domain   : local\n\
+  options  : mdns\n\
+\n\
+DNS configuration (for scoped queries)\n\
+\n\
+resolver #1\n\
+  nameserver[0] : 192.168.31.1\n\
+  flags    : Scoped, Request A records\n";
+        assert_eq!(parse_default_dns(out), None);
+    }
+
+    #[test]
+    fn parse_default_dns_empty_is_none() {
+        assert_eq!(parse_default_dns(""), None);
+    }
+
+    #[test]
+    fn dns_sync_pairs_appends_gateway_exemption_last() {
+        // 豁免必须排最后:与 suffix 同名相撞时后写者赢(helper 顺序覆盖),保重连
+        let pairs = dns_sync_pairs(
+            &["yangqianguan.com", "fintopia.tech"],
+            "10.0.104.104",
+            "work.yangqianguan.com",
+            Some("114.114.114.114"),
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                "yangqianguan.com=10.0.104.104".to_string(),
+                "fintopia.tech=10.0.104.104".to_string(),
+                "work.yangqianguan.com=114.114.114.114".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_sync_pairs_no_snapshot_no_exemption() {
+        let pairs = dns_sync_pairs(&["a.com"], "10.0.104.104", "vpn.a.com", None);
+        assert_eq!(pairs, vec!["a.com=10.0.104.104".to_string()]);
+    }
+
+    #[test]
+    fn dns_sync_pairs_ip_server_no_exemption() {
+        // server 是纯 IP:不需要 DNS,豁免是垃圾文件
+        let pairs = dns_sync_pairs(&["a.com"], "10.0.104.104", "1.2.3.4", Some("114.114.114.114"));
+        assert_eq!(pairs, vec!["a.com=10.0.104.104".to_string()]);
+    }
+
+    #[test]
+    fn dns_sync_pairs_lowercases_server() {
+        // helper 的 suffix 正则只收小写;DNS 名字大小写不敏感
+        let pairs = dns_sync_pairs(&["a.com"], "10.0.104.104", "VPN.A.com", Some("223.5.5.5"));
+        assert_eq!(
+            pairs,
+            vec!["a.com=10.0.104.104".to_string(), "vpn.a.com=223.5.5.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn dns_sync_pairs_empty_suffixes_empty() {
+        // 没有 suffix 就没有毒解析,不用豁免
+        assert!(dns_sync_pairs(&[], "10.0.104.104", "vpn.a.com", Some("223.5.5.5")).is_empty());
     }
 
     #[test]

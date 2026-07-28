@@ -134,14 +134,26 @@ async fn tun_dns_sync(cfg: &AppConfig, state: &RuntimeState) {
         eprintln!("[daemon] 未获得可用 VPN DNS,跳过 scoped resolver 配置(域名解析可走 7899 代理)");
         return;
     };
+    // 网关域名豁免:server 被某 suffix 覆盖时,断线后网关解析会被劫持到只有隧道内
+    // 可达的 VPN DNS,恢复链(等网关/重启隧道/静默重登)整条卡死(2026-07-28 过夜事故)。
+    // 无条件多写一条更精确的 /etc/resolver/<server> 指向系统 DNS 快照——macOS 按最长
+    // 后缀匹配优先,只豁免网关自己;快照过时由恢复前 dns-clean + 成功后重写自愈。
+    let sys_dns = crate::tun::system_dns_v4();
+    if sys_dns.is_none() {
+        eprintln!("[daemon] 未取到系统 DNS 快照,跳过网关域名豁免");
+    }
+    let pairs = crate::tun::dns_sync_pairs(&suffixes, dns, &state.server, sys_dns.as_deref());
     let mut cmd = Command::new("/usr/bin/sudo");
     cmd.arg("-n").arg(crate::tun::HELPER_PATH).arg("dns-sync");
-    for s in &suffixes {
-        cmd.arg(format!("{s}={dns}"));
+    for p in &pairs {
+        cmd.arg(p);
     }
     match cmd.output().await {
         Ok(out) if out.status.success() => {
             eprintln!("[daemon] scoped resolver 已同步: {} 个后缀 → {dns}", suffixes.len());
+            if let Some(ex) = pairs.get(suffixes.len()) {
+                eprintln!("[daemon] 网关域名豁免(防断线毒解析): {ex}");
+            }
         }
         Ok(out) => eprintln!(
             "[daemon] dns-sync 失败: {}",
@@ -371,10 +383,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     kill_tunnel(&mut child, args.tun).await;
     if args.tun {
         // 优雅退出才清 resolver;崩溃残留由下次 janitor 兜底
-        let _ = Command::new("/usr/bin/sudo")
-            .args(["-n", crate::tun::HELPER_PATH, "dns-clean"])
-            .output()
-            .await;
+        tun_dns_clean("退出").await;
     }
     paths.clear_state();
     Ok(())
@@ -458,6 +467,23 @@ enum RecoverOutcome {
     GiveUp,
 }
 
+/// 摘掉全部 easy-proxy 管理的 resolver 文件(helper dns-clean)。恢复入口与退出两处共用;
+/// 失败只警告不致命(sudo 坏掉时恢复照样往下走,行为等同修复前)。
+async fn tun_dns_clean(why: &str) {
+    match Command::new("/usr/bin/sudo")
+        .args(["-n", crate::tun::HELPER_PATH, "dns-clean"])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => eprintln!(
+            "[daemon] dns-clean({why})失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!("[daemon] dns-clean({why})无法执行: {e}"),
+    }
+}
+
 /// 分级恢复:①用当前 TWFID 重启 zju-connect(不吃闸门)②闸门通过则静默重登拿新 TWFID 再重启。
 /// 任一成功且探测通 → Online;全败 / 闸门拦截 / 被 shutdown 打断 → GiveUp。
 async fn attempt_recover(
@@ -469,6 +495,14 @@ async fn attempt_recover(
     current_twfid: &mut String,
     shutdown: &Arc<AtomicBool>,
 ) -> RecoverOutcome {
+    // TUN:恢复第一步先摘 scoped resolver——resolver 指向的 VPN DNS 只有隧道活着才可达,
+    // 不摘则下面每一步(等网关/重启隧道/静默重登)都要解析网关域名,整条链被毒解析卡死,
+    // 各自 ~30s 超时后 GiveUp → 永久 offline(2026-07-28 过夜断线真机事故)。
+    // 恢复成功后 tun_dns_sync 会带新的系统 DNS 快照重写,不用单独「装回」。
+    if args.tun {
+        tun_dns_clean("恢复前").await;
+    }
+
     // 先等新网络就绪(直连网关可达):路由事件触发的恢复往往抢在 DHCP/关联完成之前,
     // 不等就重启必失败,恢复流程会一路 GiveUp 把 daemon 拖下线。
     wait_gateway_reachable(args, Duration::from_secs(30), shutdown).await;
