@@ -124,7 +124,7 @@ pub fn fetch_and_submit_loop(
     let mut round = 0u32;
     while round < auto_max {
         round += 1;
-        ui.progress(&format!("  [自动] 第 {round}/{auto_max} 次取码…{hint}"));
+        ui.progress(&format!("[自动] 第 {round}/{auto_max} 次取码…{hint}"));
 
         // 非首轮:先(按需)补发一条新码,再统一等待;等待让码送达(不因是否补发而不同)。
         if prev_empty.is_some() {

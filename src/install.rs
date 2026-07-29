@@ -3,14 +3,16 @@
 //! 落盘位置见 [`crate::config::Paths`]：配置 ~/.config/easy-proxy、数据 ~/.local/share/easy-proxy、
 //! 补全软链 ~/.local/share/zsh/site-functions，全在 $HOME 下，不需要 sudo。
 
-use crate::capsule::{success_line, ANSI_BOLD_BLUE, ANSI_RESET};
+use crate::capsule::{error_line, success_line};
 use crate::config::{Paths, PromptConfig};
 use anyhow::{Context, Result};
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
+use std::io::IsTerminal;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// 编译期内嵌的 zju-connect 二进制（darwin-arm64, v1.2.0）。
 const ZJU_BIN: &[u8] = include_bytes!("../vendor/zju-connect");
@@ -71,10 +73,58 @@ fn sudoers_content(user: &str) -> String {
     format!("{user} ALL=(root) NOPASSWD: {}\n", crate::tun::HELPER_PATH)
 }
 
-/// sudo 密码提示(`sudo -p`,替换默认的 Password:):与 dialoguer 的 `› 标签: ` 输入行
-/// 同风格,自带用途说明——不另打预告行(凭证有缓存时 sudo 根本不会问,预告反而成噪音)。
-fn sudo_password_prompt(action: &str) -> String {
-    format!("{ANSI_BOLD_BLUE}›{ANSI_RESET} {action}需要 root, 请输入 sudo 密码: ")
+/// sudo 密码尝试次数上限(与 sudo 默认 passwd_tries 一致)。
+const SUDO_ATTEMPTS: u32 = 3;
+
+/// 以 root 跑一段 shell 脚本(参数经位置参数传入,不做字符串拼接),统一承接 sudo 交互:
+/// 凭证有缓存/免密时静默直跑(不弹任何提示,预告反而成噪音);需要密码时用与其他输入行
+/// 同款的 `›` 密码框自己收,经 stdin 喂给 `sudo -S`,stdout/stderr 全程捕获——PAM 原生的
+/// "Sorry, try again." 不再裸奔到终端,密码错走我们的红叉行重问,最多 3 次。
+/// 返回 Ok(output) = 已过认证(脚本自身成败由调用方检查 status 统一呈现)。
+fn sudo_script(action: &str, script: &str, args: &[&OsStr]) -> Result<std::process::Output> {
+    let base = |auth: &[&str]| {
+        let mut cmd = Command::new("/usr/bin/sudo");
+        cmd.args(auth).arg("/bin/sh").arg("-c").arg(script).arg("sh").args(args);
+        cmd
+    };
+    let out = base(&["-n"]).output().context("无法执行 sudo")?;
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if out.status.success() || !stderr.contains("password is required") {
+        return Ok(out);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow::anyhow!("{action}需要 root, 但当前无终端可输入 sudo 密码"));
+    }
+    let prompt = PromptConfig::default();
+    for attempt in 1..=SUDO_ATTEMPTS {
+        let pwd = crate::prompt_or_exit(
+            dialoguer::Password::with_theme(&crate::ep_theme())
+                .with_prompt(format!("{action}需要 root, 请输入 sudo 密码"))
+                .interact(),
+        )?;
+        let mut child = base(&["-S", "-p", ""])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("无法执行 sudo")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = writeln!(stdin, "{pwd}");
+        }
+        let out = child.wait_with_output().context("无法执行 sudo")?;
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if out.status.success() || !(stderr.contains("try again") || stderr.contains("incorrect password")) {
+            return Ok(out);
+        }
+        if attempt < SUDO_ATTEMPTS {
+            eprintln!(
+                "{}",
+                error_line(&format!("sudo 密码错误, 剩余 {} 次", SUDO_ATTEMPTS - attempt), None, &prompt)
+            );
+        }
+    }
+    Err(anyhow::anyhow!("sudo 密码连续 {SUDO_ATTEMPTS} 次错误"))
 }
 
 /// 失败细节:优先取捕获的 stderr(visudo/install 的具体报错),空则退回退出码。
@@ -122,19 +172,20 @@ install -o root -g wheel -m 0755 "$3" "$1/zju-connect"
 visudo -cf "$4" >/dev/null
 install -o root -g wheel -m 0440 "$4" /etc/sudoers.d/easy-proxy
 "#;
-    // output() 捕获 stdout/stderr:失败细节(visudo/install 的报错)并进红叉行统一呈现,
-    // 不让原始 stderr 裸奔;sudo 的密码对话走 /dev/tty,不受捕获影响。
-    let out = Command::new("/usr/bin/sudo")
-        .arg("-p").arg(sudo_password_prompt("安装 TUN 权限组件"))
-        .arg("/bin/sh").arg("-c").arg(script).arg("sh")
-        .arg(crate::tun::HELPER_DIR)
-        .arg(&helper_tmp)
-        .arg(&paths.zju_bin)
-        .arg(&sudoers_tmp)
-        .output()
-        .context("无法执行 sudo")?;
+    // 输出全捕获:失败细节(visudo/install 的报错)并进红叉行统一呈现,不让原始 stderr 裸奔。
+    let result = sudo_script(
+        "安装 TUN 权限组件",
+        script,
+        &[
+            OsStr::new(crate::tun::HELPER_DIR),
+            helper_tmp.as_os_str(),
+            paths.zju_bin.as_os_str(),
+            sudoers_tmp.as_os_str(),
+        ],
+    );
     let _ = fs::remove_file(&helper_tmp);
     let _ = fs::remove_file(&sudoers_tmp);
+    let out = result?;
     if !out.status.success() {
         return Err(anyhow::anyhow!("TUN 组件安装失败{}", sudo_failure_detail(&out)));
     }
@@ -182,11 +233,7 @@ rm -f /etc/sudoers.d/easy-proxy
 rm -rf /usr/local/libexec/easy-proxy
 exit 0
 "##;
-    let out = Command::new("/usr/bin/sudo")
-        .arg("-p").arg(sudo_password_prompt("卸载 TUN 权限组件"))
-        .arg("/bin/sh").arg("-c").arg(script)
-        .output()
-        .context("无法执行 sudo")?;
+    let out = sudo_script("卸载 TUN 权限组件", script, &[])?;
     if !out.status.success() {
         return Err(anyhow::anyhow!("卸载失败{}", sudo_failure_detail(&out)));
     }

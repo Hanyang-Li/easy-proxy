@@ -200,10 +200,10 @@ pub fn error_line(message: &str, status: Option<&ProxyStatus>, prompt: &PromptCo
     out
 }
 
-/// 中性 / 进行中 / 无对错的提示:空出 logo 位(两个空格,与 `✔ `/`✘ ` 前缀等宽),
+/// 中性 / 进行中 / 无对错的提示:logo 位放加粗蓝小圆点 `•`(与 `›` 同色、与 `✔ `/`✘ ` 等宽),
 /// 使文案左边缘与成功 / 错误行对齐。
 pub fn info_line(message: &str, status: Option<&ProxyStatus>, prompt: &PromptConfig) -> String {
-    let mut out = format!("  {message}");
+    let mut out = format!("{ANSI_BOLD_BLUE}•{ANSI_RESET} {message}");
     if let Some(status) = status {
         out.push(' ');
         out.push_str(&format_capsule(status, prompt, terminal_width(), display_width(message) + 3));
@@ -313,16 +313,16 @@ mod tests {
 
     #[test]
     fn logo_slot_widths_align() {
-        // ✔/✘ 前缀与中性两空格前缀显示宽度一致,保证三类提示文案左边缘对齐
+        // ✔/✘ 前缀与中性圆点前缀显示宽度一致,保证三类提示文案左边缘对齐
         assert_eq!(display_width("✔ "), 2);
         assert_eq!(display_width("✘ "), 2);
-        assert_eq!(display_width("  "), 2);
+        assert_eq!(display_width("• "), 2);
     }
 
     #[test]
-    fn info_line_reserves_logo_slot() {
+    fn info_line_uses_blue_dot_logo() {
         let p = PromptConfig::default();
-        assert_eq!(info_line("连接中…", None, &p), "  连接中…");
+        assert_eq!(info_line("连接中…", None, &p), format!("{ANSI_BOLD_BLUE}•{ANSI_RESET} 连接中…"));
     }
 
     #[test]

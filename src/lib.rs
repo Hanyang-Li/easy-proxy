@@ -161,7 +161,7 @@ fn install_sigint_handler() {
 
 /// 交互输入主题:把左侧 logo 换成本项目的加粗蓝 `›`(与 spinner 同蓝、与 ✔/✘ 同宽同风格),
 /// 冒号后缀承接参考项目 `› 标签: ` 的观感;成功/错误前缀沿用 dialoguer 的绿 ✔ / 红 ✘。
-fn ep_theme() -> dialoguer::theme::ColorfulTheme {
+pub(crate) fn ep_theme() -> dialoguer::theme::ColorfulTheme {
     use dialoguer::console::style;
     dialoguer::theme::ColorfulTheme {
         prompt_prefix: style("›".to_string())
@@ -175,7 +175,7 @@ fn ep_theme() -> dialoguer::theme::ColorfulTheme {
 
 /// Ctrl-C 落在 dialoguer 输入上时(其读取期间 ISIG 关闭,不产生信号)会返回 Interrupted;
 /// 这里统一映射成「干净退出 130」,与 raw / spinner 阶段的 Ctrl-C 行为一致。
-fn prompt_or_exit<T>(r: dialoguer::Result<T>) -> Result<T> {
+pub(crate) fn prompt_or_exit<T>(r: dialoguer::Result<T>) -> Result<T> {
     match r {
         Ok(v) => Ok(v),
         Err(dialoguer::Error::IO(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -191,7 +191,10 @@ fn wait_sms_file(path: &str) -> Result<String> {
     use std::time::{Duration, Instant};
     let p = std::path::Path::new(path);
     let _ = std::fs::remove_file(p);
-    eprintln!("  [自动化] 等待验证码写入 {path}（180s 超时）");
+    // 「进行中」状态:tty 转 spinner、非 tty 打一条蓝点行;结束后清行,
+    // 由后续结果行(✔ 验证码已通过 / ✘ 被拒 / ✘ 超时)原地接替。
+    let line = StatusLine::new();
+    line.progress(&format!("[自动化] 等待验证码写入 {path}（180s 超时）"));
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if let Ok(s) = std::fs::read_to_string(p) {
@@ -199,10 +202,12 @@ fn wait_sms_file(path: &str) -> Result<String> {
             let _ = std::fs::remove_file(p);
             if !code.is_empty() && code.chars().all(|c| c.is_ascii_digit()) && (4..=8).contains(&code.len())
             {
+                line.clear();
                 return Ok(code);
             }
         }
         if Instant::now() >= deadline {
+            line.clear();
             return Err(anyhow!("等待验证码超时"));
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -306,15 +311,15 @@ impl StatusLine {
     }
 
     /// 刷成一条「进行中」的行:tty 上首次调用拉起后台 spinner 线程、其后仅更新文案(线程自转);
-    /// 非 tty 逐行打印。spinner 字形取加粗蓝、文案留默认色,前缀与 ✔/✘ 同宽对齐。
+    /// 非 tty 逐行打印(蓝点前缀,与 info 行同款)。spinner 字形取加粗蓝、文案留默认色,前缀与 ✔/✘ 同宽对齐。
     fn progress(&self, text: &str) {
         if !self.tty {
-            eprintln!("{text}");
+            eprintln!("{}•{} {text}", capsule::ANSI_BOLD_BLUE, capsule::ANSI_RESET);
             return;
         }
         {
             let mut s = self.state.lock().unwrap();
-            s.msg = text.trim_start().to_string(); // 去掉旧的两空格 logo 位,交给 spinner 字形占位
+            s.msg = text.to_string(); // logo 位由 spinner 字形占,文案不带前缀
             s.done = false;
         }
         let mut h = self.handle.lock().unwrap();
@@ -346,15 +351,17 @@ impl StatusLine {
         }
     }
 
-    /// 停转后台 spinner 并等它退出(未启动则无操作)。
-    fn stop(&self) {
+    /// 停转后台 spinner 并等它退出(未启动则无操作);返回是否真停了一个在转的线程。
+    fn stop(&self) -> bool {
         {
             let mut s = self.state.lock().unwrap();
             s.done = true;
         }
         if let Some(h) = self.handle.lock().unwrap().take() {
             let _ = h.join();
+            return true;
         }
+        false
     }
 
     /// 定格一条最终结果行:停转 spinner,覆盖掉进行中的行并换行。
@@ -379,8 +386,12 @@ impl StatusLine {
 
 impl Drop for StatusLine {
     fn drop(&mut self) {
-        // 漏调 finish/clear(如错误向上传播)时,确保后台线程停下,别在后续输出上继续刷屏。
-        self.stop();
+        // 漏调 finish/clear(如错误向上传播)时:停线程 + 清掉残留的进行中行,
+        // 免得后续输出(顶层 ✘ 行)黏在无换行的 spinner 行尾。
+        if self.stop() && self.tty {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
     }
 }
 
@@ -501,7 +512,10 @@ fn automation_via_file(cfg: &AppConfig, jar: &Path, path: &str) -> Result<String
     for attempt in 1..=FILE_ATTEMPTS {
         let code = wait_sms_file(path)?;
         match login::submit_sms(&cfg.server, cfg.port, jar, &code)? {
-            login::SmsOutcome::Accepted(twfid) => return Ok(twfid),
+            login::SmsOutcome::Accepted(twfid) => {
+                eprintln!("{}", success_line("[自动化] 验证码已通过", None, &cfg.prompt));
+                return Ok(twfid);
+            }
             login::SmsOutcome::Rejected(why) => {
                 eprintln!(
                     "{}",
@@ -533,6 +547,43 @@ fn ensure_tun_ready(paths: &Paths) -> Result<()> {
         return Err(anyhow!("{what},请先执行 easy-proxy install --tun"));
     }
     install::install_tun(paths)
+}
+
+/// 「phase=Online 但探针不通」时原地等看门狗自愈的结局。
+enum Recovery {
+    /// 恢复在线(带实测胶囊)。
+    Recovered(ProxyStatus),
+    /// 等满仍不通:看门狗还在后台重试,不杀它(省一次短信),由调用方红叉退出。
+    TimedOut,
+    /// daemon 转入 Reconnecting(方案 Z,需要输码,后台自己好不了)或退出:交调用方接管登录。
+    NeedsTakeover,
+}
+
+/// 原地等看门狗自愈:spinner 转动,每秒复读状态 + 探针,最多 60s(覆盖一个保活周期)。
+/// 全程只读轮询、不碰 daemon——Ctrl-C 随时退出也不影响后台重试。
+fn wait_watchdog_recovery(paths: &Paths) -> Recovery {
+    use std::time::{Duration, Instant};
+    let line = StatusLine::new();
+    line.progress("隧道恢复中(看门狗重连中)…");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(1));
+        let Some(st) = paths.read_state() else {
+            line.clear();
+            return Recovery::NeedsTakeover;
+        };
+        if !tunnel::pid_alive(st.daemon_pid) || st.phase != config::Phase::Online {
+            line.clear();
+            return Recovery::NeedsTakeover;
+        }
+        let status = runtime_capsule(&st);
+        if status.state == ConnState::Online {
+            line.clear();
+            return Recovery::Recovered(status);
+        }
+    }
+    line.clear();
+    Recovery::TimedOut
 }
 
 fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) -> Result<()> {
@@ -569,14 +620,28 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) ->
                 let status = runtime_capsule(&st);
                 if status.state == ConnState::Online {
                     println!("{}", success_line("已经在连接中", Some(&status), &cfg.prompt));
-                } else {
-                    // phase=Online 但实测隧道不通:看门狗将自动恢复,不由本次 connect 接管(省一次短信)
-                    println!(
-                        "{}",
-                        info_line("隧道恢复中(看门狗将自动重连)", Some(&status), &cfg.prompt)
-                    );
+                    return Ok(());
                 }
-                return Ok(());
+                // phase=Online 但实测隧道不通:原地等看门狗自愈,恢复 → ✔ 已连接;
+                // 超时 → ✘ 退出(看门狗继续后台重试);转入 Reconnecting/daemon 退出 → 落到下方接管登录
+                match wait_watchdog_recovery(paths) {
+                    Recovery::Recovered(status) => {
+                        println!("{}", success_line("已连接", Some(&status), &cfg.prompt));
+                        return Ok(());
+                    }
+                    Recovery::TimedOut => {
+                        eprintln!(
+                            "{}",
+                            error_line(
+                                "恢复超时,看门狗仍在后台重试,可稍后 easy-proxy status 查看",
+                                None,
+                                &cfg.prompt
+                            )
+                        );
+                        std::process::exit(1);
+                    }
+                    Recovery::NeedsTakeover => {}
+                }
             }
             eprintln!(
                 "{}",
@@ -642,7 +707,7 @@ fn cmd_connect(paths: &Paths, cfg: &AppConfig, relogin: bool, tun_mode: bool) ->
     // 「连接中…」进度行：覆盖「建隧道就绪」+「延迟探测」整段（否则探测那几秒静默像假死），
     // 到最后一刻才清行、让 stdout 的「已连接」胶囊接上。
     let line = StatusLine::new();
-    line.progress("  连接中…");
+    line.progress("连接中…");
     let ready = tunnel::wait_ready(paths, std::time::Duration::from_secs(45))
         .map(|st| runtime_capsule(&st));
     line.clear(); // 无论成功失败，先清掉进度行，别让后续输出黏在「连接中…」后面
