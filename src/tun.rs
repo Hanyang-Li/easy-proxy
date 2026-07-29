@@ -25,20 +25,41 @@ PIDFILE="/var/run/easy-proxy-tun.pid"
 EXEMPT_FILE="/var/run/easy-proxy-route-exempt"
 RESOLVER_DIR="/etc/resolver"
 MARKER="# managed by easy-proxy"
+HOSTS_FILE="/etc/hosts"
+HOSTS_MARKER="# easy-proxy-pin"
 
 die() { echo "ep-tun-helper: $*" >&2; exit 1; }
 match() { printf '%s' "$1" | grep -Eq "$2"; }
 
 [ "$(id -u)" = "0" ] || die "需要 root(应经 sudo 调用)"
 
-# 摘网关豁免主机路由(按记录文件),隧道停/清残留时调用
+# 摘全部网关豁免主机路由(记录文件每行一个 IP),隧道停/清残留时调用
 route_unexempt() {
   [ -f "$EXEMPT_FILE" ] || return 0
-  ip=$(cat "$EXEMPT_FILE" 2>/dev/null || true)
-  if match "${ip:-}" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-    /sbin/route -n delete -host "$ip" >/dev/null 2>&1 || true
-  fi
+  while IFS= read -r ip; do
+    if match "${ip:-}" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+      /sbin/route -n delete -host "$ip" >/dev/null 2>&1 || true
+    fi
+  done < "$EXEMPT_FILE"
   rm -f "$EXEMPT_FILE"
+}
+
+# 钉一个网关豁免主机路由(幂等追加):到网关自身的流量必须走物理口。
+# 失败只警告不致命——没有豁免时隧道仍能连上(~78s 后死,由看门狗自愈),比连不上强。
+route_exempt_one() {
+  ip="$1"
+  gw=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+  if ! match "${gw:-}" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "ep-tun-helper: 取不到物理默认网关,跳过豁免 $ip" >&2
+    return 0
+  fi
+  /sbin/route -n delete -host "$ip" >/dev/null 2>&1 || true
+  if /sbin/route -n add -host "$ip" "$gw" >/dev/null 2>&1; then
+    grep -qx "$ip" "$EXEMPT_FILE" 2>/dev/null || echo "$ip" >> "$EXEMPT_FILE"
+  else
+    echo "ep-tun-helper: 豁免路由添加失败: $ip -> $gw" >&2
+  fi
+  return 0
 }
 
 # 按 pidfile 停隧道:校验 pid 的可执行路径确为 root copy,防 pid 复用误杀
@@ -57,7 +78,20 @@ stop_tunnel() {
   rm -f "$PIDFILE"
 }
 
+# 摘 /etc/hosts 里的网关域名 pin(带行尾标记的行)。cat 重定向保 inode/权限。
+hosts_unpin() {
+  grep -q "$HOSTS_MARKER" "$HOSTS_FILE" 2>/dev/null || return 0
+  tmp="/var/run/easy-proxy-hosts.$$"
+  grep -v "$HOSTS_MARKER" "$HOSTS_FILE" > "$tmp" 2>/dev/null || true
+  cat "$tmp" > "$HOSTS_FILE"
+  rm -f "$tmp"
+  return 0
+}
+
+# dns_clean 语义 = 清掉 easy-proxy 注入的一切域名解析改动(resolver 文件 + hosts pin),
+# 恢复前与退出时共用:保证网关域名解析回到系统原生路径。
 dns_clean() {
+  hosts_unpin
   [ -d "$RESOLVER_DIR" ] || return 0
   for f in "$RESOLVER_DIR"/*; do
     [ -f "$f" ] || continue
@@ -71,7 +105,7 @@ if [ $# -gt 0 ]; then shift; fi
 
 case "$cmd" in
   start-tunnel)
-    server=""; https_port=""; twfid=""; socks=""; http=""
+    server=""; https_port=""; twfid=""; socks=""; http=""; exempt_ips=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --server)     server="$2";     shift 2 ;;
@@ -79,6 +113,7 @@ case "$cmd" in
         --twfid)      twfid="$2";      shift 2 ;;
         --socks)      socks="$2";      shift 2 ;;
         --http)       http="$2";       shift 2 ;;
+        --exempt-ips) exempt_ips="$2"; shift 2 ;;
         *) die "未知参数: $1" ;;
       esac
     done
@@ -87,7 +122,17 @@ case "$cmd" in
     match "$twfid" '^[A-Za-z0-9]+$'           || die "twfid 非法"
     match "$socks" '^127\.0\.0\.1:[0-9]+$'    || die "socks 非法"
     match "$http" '^127\.0\.0\.1:[0-9]+$'     || die "http 非法"
+    if [ -n "$exempt_ips" ]; then
+      match "$exempt_ips" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)*$' || die "exempt-ips 非法"
+    fi
     stop_tunnel
+    # 网关豁免必须在 zju-connect 启动**之前**钉好:zju 的 L3 数据连接 dial 与
+    # -add-route 批量加路由是并发竞速,路由先生效时 dial 源地址被绑到 utun 虚拟 IP,
+    # SYN 进自己的 TUN 黑洞,~75s 超时 panic → 隧道 78s 必死(2026-07-29 真机抓包实锤:
+    # SYN_SENT 源 2.0.1.44)。先钉豁免则 dial 恒走物理口,竞态消失。
+    for eip in $(printf '%s' "$exempt_ips" | tr ',' ' '); do
+      route_exempt_one "$eip"
+    done
     echo "$$" > "$PIDFILE"
     # exec 不换 pid,pidfile 即隧道进程;stdout/stderr 继承调用方 fd(tunnel.log)
     exec "$ZJU" -server "$server" -port "$https_port" -twf-id "$twfid" \
@@ -100,18 +145,23 @@ case "$cmd" in
     route_unexempt
     ;;
   route-exempt)
-    # 网关豁免:到 VPN 网关自身的流量必须走物理口。服务端下发的 TUN 路由罩住全公网
-    # 且不排除网关,zju-connect 每 60s 的 update_session 保活会被吸进隧道回环,
-    # 服务端判 idle 断会话 → 隧道 ~2 分钟必死(2026-07-28 真机事故)。
-    # 主机路由比任何网段更精确,必然优先。
-    ip="${1:-}"
+    # 就绪后按实连 IP 补钉豁免(幂等追加,不清启动前已钉的解析 IP——update_session
+    # 会重新解析域名,解析出的 IP 与实连 IP 都必须保持豁免)。
+    [ $# -gt 0 ] || die "route-exempt 需要至少一个 ip"
+    for ip in "$@"; do
+      match "$ip" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || die "ip 非法: $ip"
+      route_exempt_one "$ip"
+    done
+    ;;
+  hosts-pin)
+    # 网关域名 pin 进 /etc/hosts(实连 IP):运行期 zju 重建连接/会话保活都要重新
+    # 解析网关域名,而 scoped resolver 的快照 DNS 可能解析不出它(2026-07-29 真机:
+    # 豁免条目指向 114 → lookup no such host → panic)。hosts 优先于一切 DNS,连根解决。
+    ip="${1:-}"; domain="${2:-}"
     match "$ip" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || die "ip 非法"
-    gw=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
-    match "${gw:-}" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || die "无法取得物理默认网关(gateway=${gw:-空})"
-    route_unexempt
-    /sbin/route -n delete -host "$ip" >/dev/null 2>&1 || true
-    /sbin/route -n add -host "$ip" "$gw" >/dev/null 2>&1 || die "添加豁免路由失败: $ip -> $gw"
-    echo "$ip" > "$EXEMPT_FILE"
+    match "$domain" '^[A-Za-z0-9.-]+$'             || die "domain 非法"
+    hosts_unpin
+    printf '%s %s %s\n' "$ip" "$domain" "$HOSTS_MARKER" >> "$HOSTS_FILE"
     ;;
   dns-sync)
     [ $# -gt 0 ] || die "dns-sync 需要至少一个 suffix=ip"
@@ -208,66 +258,13 @@ pub fn default_route_is_utun(route_get_output: &str) -> bool {
         .any(|v| v.trim().starts_with("utun"))
 }
 
-/// 从 `scutil --dns` 输出解析默认(非 scoped)DNS 的首个 IPv4 nameserver。
-/// 只看主段(「DNS configuration (for scoped queries)」之前),跳过带 domain 的块
-/// (mdns 与 /etc/resolver 派生的都带 domain);拿不到返回 None。
-pub fn parse_default_dns(scutil_out: &str) -> Option<String> {
-    let mut in_domain_block = false;
-    for line in scutil_out.lines() {
-        let t = line.trim();
-        if t.starts_with("DNS configuration (for scoped queries)") {
-            return None;
-        }
-        if t.starts_with("resolver #") {
-            in_domain_block = false;
-            continue;
-        }
-        // 块首的 domain 行(mdns / etc-resolver 派生块);「search domain[0]」不算
-        if t.starts_with("domain") {
-            in_domain_block = true;
-            continue;
-        }
-        if in_domain_block {
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("nameserver[") {
-            if let Some(ip) = rest.splitn(2, ':').nth(1).map(str::trim) {
-                if valid_ipv4(ip) {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 抓当前系统默认 DNS 快照(供网关域名豁免 resolver 用)。
-pub fn system_dns_v4() -> Option<String> {
-    let out = std::process::Command::new("/usr/sbin/scutil").arg("--dns").output().ok()?;
-    parse_default_dns(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// 组装 dns-sync 的 `name=ip` 参数列表:各 suffix → vpn_dns,末尾追加网关域名豁免
-/// (server → 系统 DNS 快照)。豁免必须排最后:与 suffix 同名相撞时后写者赢,保重连。
-/// server 为纯 IP / 快照缺失 / suffixes 为空(无毒可解)时不写豁免。
-pub fn dns_sync_pairs(
-    suffixes: &[&str],
-    vpn_dns: &str,
-    server: &str,
-    sys_dns: Option<&str>,
-) -> Vec<String> {
-    if suffixes.is_empty() {
-        return Vec::new();
-    }
-    let mut pairs: Vec<String> = suffixes.iter().map(|s| format!("{s}={vpn_dns}")).collect();
-    // 豁免值必须过 helper 的同款白名单——一个坏 pair 会让整次 dns-sync 连 suffix 一起失败
-    let server = server.to_ascii_lowercase();
-    if let Some(dns) = sys_dns {
-        if valid_suffix(&server) && !valid_ipv4(&server) && valid_ipv4(dns) {
-            pairs.push(format!("{server}={dns}"));
-        }
-    }
-    pairs
+/// 组装 dns-sync 的 `name=ip` 参数列表:各 suffix → vpn_dns。
+///
+/// 网关域名的解析保护不再走 resolver 豁免条目(2026-07-29 真机事故:快照 DNS
+/// 114.114.114.114 解析不出网关域名,zju 运行期重建连接 lookup 失败直接 panic),
+/// 改由 helper hosts-pin 把网关域名 pin 到实连 IP——hosts 优先于一切 resolver。
+pub fn dns_sync_pairs(suffixes: &[&str], vpn_dns: &str) -> Vec<String> {
+    suffixes.iter().map(|s| format!("{s}={vpn_dns}")).collect()
 }
 
 /// 组一条 `sudo -n <helper> <args...>` 命令(-n:免密不可用立即失败,绝不挂在密码提示上)。
@@ -376,129 +373,23 @@ mod tests {
         assert!(!default_route_is_utun("")); // 拿不到输出不误报
     }
 
-    /// 真机 scutil --dns 形状(2026-07-28 抓取):resolver #1 无 domain 行,后续 mdns 块都有。
-    const SCUTIL_REAL: &str = "DNS configuration\n\
-\n\
-resolver #1\n\
-  nameserver[0] : 114.114.114.114\n\
-  flags    : Request A records\n\
-  reach    : 0x00000002 (Reachable)\n\
-\n\
-resolver #2\n\
-  domain   : local\n\
-  options  : mdns\n\
-  timeout  : 5\n\
-  flags    : Request A records\n\
-  reach    : 0x00000000 (Not Reachable)\n\
-  order    : 300000\n";
-
     #[test]
-    fn parse_default_dns_real_shape() {
-        assert_eq!(parse_default_dns(SCUTIL_REAL), Some("114.114.114.114".to_string()));
-    }
-
-    #[test]
-    fn parse_default_dns_search_domain_line_is_not_domain() {
-        // DHCP 网络下 resolver #1 常带 search domain[0] 行——不能误认成 domain 块跳过
-        let out = "DNS configuration\n\
-\n\
-resolver #1\n\
-  search domain[0] : lan\n\
-  nameserver[0] : 192.168.31.1\n\
-  if_index : 14 (en0)\n";
-        assert_eq!(parse_default_dns(out), Some("192.168.31.1".to_string()));
-    }
-
-    #[test]
-    fn parse_default_dns_skips_domain_scoped_blocks() {
-        // 带 domain 的块(/etc/resolver 派生、mdns)一律跳过,即使排在前面
-        let out = "DNS configuration\n\
-\n\
-resolver #1\n\
-  domain   : yangqianguan.com\n\
-  nameserver[0] : 10.0.104.104\n\
-\n\
-resolver #2\n\
-  nameserver[0] : 114.114.114.114\n";
-        assert_eq!(parse_default_dns(out), Some("114.114.114.114".to_string()));
-    }
-
-    #[test]
-    fn parse_default_dns_prefers_ipv4_within_block() {
-        let out = "resolver #1\n\
-  nameserver[0] : fe80::1\n\
-  nameserver[1] : 223.5.5.5\n";
-        assert_eq!(parse_default_dns(out), Some("223.5.5.5".to_string()));
-    }
-
-    #[test]
-    fn parse_default_dns_ignores_scoped_queries_section() {
-        // 主段没有可用 IPv4 → None;不去 scoped queries 段捡(那是 per-interface 配置)
-        let out = "DNS configuration\n\
-\n\
-resolver #1\n\
-  domain   : local\n\
-  options  : mdns\n\
-\n\
-DNS configuration (for scoped queries)\n\
-\n\
-resolver #1\n\
-  nameserver[0] : 192.168.31.1\n\
-  flags    : Scoped, Request A records\n";
-        assert_eq!(parse_default_dns(out), None);
-    }
-
-    #[test]
-    fn parse_default_dns_empty_is_none() {
-        assert_eq!(parse_default_dns(""), None);
-    }
-
-    #[test]
-    fn dns_sync_pairs_appends_gateway_exemption_last() {
-        // 豁免必须排最后:与 suffix 同名相撞时后写者赢(helper 顺序覆盖),保重连
-        let pairs = dns_sync_pairs(
-            &["yangqianguan.com", "fintopia.tech"],
-            "10.0.104.104",
-            "work.yangqianguan.com",
-            Some("114.114.114.114"),
-        );
+    fn dns_sync_pairs_maps_suffixes_to_vpn_dns() {
+        // 网关域名豁免条目已废(hosts-pin 取代):pairs 只含 suffix 映射,
+        // 绝不能再出现指向快照 DNS 的网关域名条目(2026-07-29 毒解析事故)
+        let pairs = dns_sync_pairs(&["yangqianguan.com", "fintopia.tech"], "10.0.104.104");
         assert_eq!(
             pairs,
             vec![
                 "yangqianguan.com=10.0.104.104".to_string(),
                 "fintopia.tech=10.0.104.104".to_string(),
-                "work.yangqianguan.com=114.114.114.114".to_string(),
             ]
         );
     }
 
     #[test]
-    fn dns_sync_pairs_no_snapshot_no_exemption() {
-        let pairs = dns_sync_pairs(&["a.com"], "10.0.104.104", "vpn.a.com", None);
-        assert_eq!(pairs, vec!["a.com=10.0.104.104".to_string()]);
-    }
-
-    #[test]
-    fn dns_sync_pairs_ip_server_no_exemption() {
-        // server 是纯 IP:不需要 DNS,豁免是垃圾文件
-        let pairs = dns_sync_pairs(&["a.com"], "10.0.104.104", "1.2.3.4", Some("114.114.114.114"));
-        assert_eq!(pairs, vec!["a.com=10.0.104.104".to_string()]);
-    }
-
-    #[test]
-    fn dns_sync_pairs_lowercases_server() {
-        // helper 的 suffix 正则只收小写;DNS 名字大小写不敏感
-        let pairs = dns_sync_pairs(&["a.com"], "10.0.104.104", "VPN.A.com", Some("223.5.5.5"));
-        assert_eq!(
-            pairs,
-            vec!["a.com=10.0.104.104".to_string(), "vpn.a.com=223.5.5.5".to_string()]
-        );
-    }
-
-    #[test]
     fn dns_sync_pairs_empty_suffixes_empty() {
-        // 没有 suffix 就没有毒解析,不用豁免
-        assert!(dns_sync_pairs(&[], "10.0.104.104", "vpn.a.com", Some("223.5.5.5")).is_empty());
+        assert!(dns_sync_pairs(&[], "10.0.104.104").is_empty());
     }
 
     #[test]
@@ -513,7 +404,20 @@ resolver #1\n\
         // 否则断开后残留主机路由指向旧物理网关,切网后网关域名解析仍会走错口
         assert!(HELPER_SCRIPT.contains("route-exempt)"));
         assert!(HELPER_SCRIPT.contains("/var/run/easy-proxy-route-exempt"));
-        assert!(HELPER_SCRIPT.matches("    route_unexempt").count() >= 3, "stop-tunnel/janitor/route-exempt 三处都应清旧豁免");
+        assert!(HELPER_SCRIPT.matches("    route_unexempt").count() >= 2, "stop-tunnel/janitor 两处都应清豁免");
+        // hosts pin:子命令存在;dns_clean 必须顺带清 hosts pin(恢复前/退出共用)
+        assert!(HELPER_SCRIPT.contains("hosts-pin)"));
+        assert!(HELPER_SCRIPT.contains("# easy-proxy-pin"));
+        let dns_clean_fn = HELPER_SCRIPT.split("dns_clean() {").nth(1).and_then(|s| s.split('}').next()).expect("dns_clean 函数存在");
+        assert!(dns_clean_fn.contains("hosts_unpin"), "dns_clean 必须清 hosts pin");
+        // 竞态修复核心不变量:start-tunnel 必须在 exec zju 之前钉预豁免
+        // (--exempt-ips 参数 + route_exempt_one 调用先于 exec 出现)
+        assert!(HELPER_SCRIPT.contains("--exempt-ips"));
+        // start-tunnel 分支之后,首个 route_exempt_one 调用必须先于唯一的 exec
+        let after_start = HELPER_SCRIPT.split("start-tunnel)").nth(1).expect("start-tunnel 块存在");
+        let exempt_pos = after_start.find("route_exempt_one").expect("start-tunnel 内有预豁免");
+        let exec_pos = after_start.find("exec \"$ZJU\"").expect("start-tunnel 内有 exec");
+        assert!(exempt_pos < exec_pos, "预豁免必须先于 exec zju-connect");
         // root copy 路径由 DIR + 文件名拼成,两个组成部分都必须与常量一致
         assert!(HELPER_SCRIPT.contains(&format!("DIR=\"{HELPER_DIR}\"")));
         assert!(HELPER_SCRIPT.contains("ZJU=\"$DIR/zju-connect\""));

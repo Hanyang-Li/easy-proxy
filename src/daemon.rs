@@ -57,6 +57,26 @@ fn zju_args(a: &ServeArgs) -> Vec<String> {
     ]
 }
 
+/// 解析 server 域名的全部 IPv4(启动隧道前调用,此刻无 TUN 路由、解析干净)。
+/// zju-connect 运行期会自行重新解析网关域名并 dial,这些 IP 必须在它启动前
+/// 全部钉上豁免路由,否则 dial 源地址被绑到 utun 虚拟 IP、SYN 进自己的黑洞。
+fn resolve_gateway_ips(server: &str, port: u16) -> Vec<String> {
+    use std::net::ToSocketAddrs;
+    let mut ips: Vec<String> = (server, port)
+        .to_socket_addrs()
+        .map(|it| {
+            it.filter_map(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+                _ => None,
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
 /// 构造隧道启动命令:Proxy 直接跑用户态 zju-connect;TUN 经 sudo -n helper(root)。
 /// TUN 分支先做 Rust 侧预校验,坏参数在 spawn 前就报错(helper 内还有最终校验)。
 fn tunnel_command(paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<Command> {
@@ -71,6 +91,13 @@ fn tunnel_command(paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<Comman
             .arg("--twfid").arg(twfid)
             .arg("--socks").arg(&args.socks)
             .arg("--http").arg(&args.http);
+        let ips = resolve_gateway_ips(&args.server, args.https_port);
+        if ips.is_empty() {
+            eprintln!("[daemon] 启动前解析网关 IP 失败,跳过预豁免(隧道可能踩启动竞态)");
+        } else {
+            eprintln!("[daemon] 启动前预豁免网关 IP: {}", ips.join(","));
+            cmd.arg("--exempt-ips").arg(ips.join(","));
+        }
         Ok(cmd)
     } else {
         let mut a = args.clone();
@@ -159,15 +186,9 @@ async fn tun_dns_sync(cfg: &AppConfig, state: &RuntimeState) {
         eprintln!("[daemon] 未获得可用 VPN DNS,跳过 scoped resolver 配置(域名解析可走 7899 代理)");
         return;
     };
-    // 网关域名豁免:server 被某 suffix 覆盖时,断线后网关解析会被劫持到只有隧道内
-    // 可达的 VPN DNS,恢复链(等网关/重启隧道/静默重登)整条卡死(2026-07-28 过夜事故)。
-    // 无条件多写一条更精确的 /etc/resolver/<server> 指向系统 DNS 快照——macOS 按最长
-    // 后缀匹配优先,只豁免网关自己;快照过时由恢复前 dns-clean + 成功后重写自愈。
-    let sys_dns = crate::tun::system_dns_v4();
-    if sys_dns.is_none() {
-        eprintln!("[daemon] 未取到系统 DNS 快照,跳过网关域名豁免");
-    }
-    let pairs = crate::tun::dns_sync_pairs(&suffixes, dns, &state.server, sys_dns.as_deref());
+    // 网关域名的解析保护由 hosts-pin 承担(resolver 豁免条目已废——快照 DNS 可能
+    // 解析不出网关域名,反成毒源:2026-07-29 真机 lookup no such host → zju panic)
+    let pairs = crate::tun::dns_sync_pairs(&suffixes, dns);
     let mut cmd = Command::new("/usr/bin/sudo");
     cmd.arg("-n").arg(crate::tun::HELPER_PATH).arg("dns-sync");
     for p in &pairs {
@@ -176,15 +197,65 @@ async fn tun_dns_sync(cfg: &AppConfig, state: &RuntimeState) {
     match cmd.output().await {
         Ok(out) if out.status.success() => {
             eprintln!("[daemon] scoped resolver 已同步: {} 个后缀 → {dns}", suffixes.len());
-            if let Some(ex) = pairs.get(suffixes.len()) {
-                eprintln!("[daemon] 网关域名豁免(防断线毒解析): {ex}");
-            }
         }
         Ok(out) => eprintln!(
             "[daemon] dns-sync 失败: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ),
         Err(e) => eprintln!("[daemon] dns-sync 无法执行: {e}"),
+    }
+}
+
+/// 网关域名 pin 进 /etc/hosts(实连 IP):zju 运行期重建连接/我们的兜底保活都要
+/// 解析网关域名,hosts 优先于一切 resolver,保证解析永远指向可达的实连 IP。
+/// server 为纯 IP 时无需 pin;失败只警告(解析仍可走系统 DNS,行为同旧)。
+async fn tun_hosts_pin(gateway_ip: Option<&str>, server: &str) {
+    if crate::tun::valid_ipv4(server) {
+        return;
+    }
+    let Some(ip) = gateway_ip.filter(|s| crate::tun::valid_ipv4(s)) else {
+        return; // route-exempt 已对缺失情况告警过,不重复
+    };
+    match Command::new("/usr/bin/sudo")
+        .args(["-n", crate::tun::HELPER_PATH, "hosts-pin", ip, server])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            eprintln!("[daemon] 网关域名已 pin: {server} → {ip}(/etc/hosts)");
+        }
+        Ok(out) => eprintln!(
+            "[daemon] hosts-pin 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!("[daemon] hosts-pin 无法执行: {e}"),
+    }
+}
+
+/// 兜底会话保活:替 zju-connect 发 /por/update_session.csp(它内部的该保活因 bug
+/// 恒败,服务端 ~4 分钟判会话 idle 掐数据连接——2026-07-29 真机 broken pipe 实锤)。
+/// 直连网关(清代理 env;TUN 下有豁免路由+hosts pin 护航),失败仅日志。
+async fn send_update_session(server: String, port: u16, twfid: String) {
+    let url = format!("https://{server}:{port}/por/update_session.csp?apiversion=1&twfid={twfid}");
+    let cookie = format!("Cookie: TWFID={twfid}");
+    let mut cmd = Command::new("/usr/bin/curl");
+    for v in crate::login::PROXY_ENV {
+        cmd.env_remove(v);
+    }
+    cmd.args([
+        "-sk", "-o", "/dev/null", "--max-time", "8", "-w", "%{http_code}",
+        "-H", &cookie,
+        "-H", "User-Agent: EasyConnect_Linux_Ubuntu",
+        &url,
+    ]);
+    match cmd.output().await {
+        Ok(out) => {
+            let code = String::from_utf8_lossy(&out.stdout);
+            if code.trim() != "200" {
+                eprintln!("[daemon] 兜底会话保活失败: http {}", code.trim());
+            }
+        }
+        Err(e) => eprintln!("[daemon] 兜底会话保活无法执行: {e}"),
     }
 }
 
@@ -227,6 +298,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
                     return Err(e);
                 }
                 tun_route_exempt(info.gateway_ip.as_deref()).await;
+                tun_hosts_pin(info.gateway_ip.as_deref(), &args.server).await;
             }
             state.vpn_dns = pick_probe_target(&args, info.vpn_dns).await;
             // scoped resolver 在探针选型后写:UDP DNS 探针不通说明经隧道 DNS 真不可用,
@@ -291,6 +363,8 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     tick.tick().await;
     let mut fails: u32 = 0;
     let mut current_twfid = args.twfid.clone();
+    // 兜底会话保活:ready 后立发一次,此后随健康检查节拍(60s)每轮一次
+    tokio::spawn(send_update_session(args.server.clone(), args.https_port, current_twfid.clone()));
 
     // 路由事件订阅:切网/唤醒秒级感知(事件→防抖→立即探测);不可用则只剩定时探测兜底。
     let (mut route_child, mut route_lines) = match spawn_route_monitor() {
@@ -374,6 +448,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
                 }
             }
             Ev::Probe => {
+                tokio::spawn(send_update_session(args.server.clone(), args.https_port, current_twfid.clone()));
                 if probe(&args, state.vpn_dns.as_deref()).await {
                     fails = 0; // online:不打日志、不重写 state
                 } else {
@@ -570,6 +645,7 @@ async fn attempt_recover(
                         return RecoverOutcome::GiveUp;
                     }
                     tun_route_exempt(info.gateway_ip.as_deref()).await;
+                    tun_hosts_pin(info.gateway_ip.as_deref(), &args.server).await;
                 }
                 // 新隧道上重选探针目标(必要时降级),再按选定目标验活
                 state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
@@ -640,6 +716,7 @@ async fn attempt_recover(
                     return RecoverOutcome::GiveUp;
                 }
                 tun_route_exempt(info.gateway_ip.as_deref()).await;
+                tun_hosts_pin(info.gateway_ip.as_deref(), &args.server).await;
             }
             state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
             if probe(args, state.vpn_dns.as_deref()).await {
