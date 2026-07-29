@@ -116,13 +116,30 @@ pub fn probe_latency(port: u16, server: &str) -> Delay {
     Delay::Timeout
 }
 
-/// 面向 CLI(status/connect)的延迟探测:state 带 vpn_dns → SOCKS5 穿隧道探测
-/// (经 mixed_port,首字节 0x05 会被 relay 到 socks 上游,顺带验证转发层);
-/// 否则回退 curl 直连网关(旧行为,对隧道假死不敏感)。
-/// 单次 1.5s:交互命令要快——健康隧道的 SOCKS 往返远小于此,判死则立即出黄胶囊,
+/// 面向 CLI(status/connect)的延迟探测,按模式分流:
+/// - TUN + vpn_dns:UDP DNS 查询直发 VPN DNS(内核路由送进 utun,测真数据面)。
+///   绝不能经代理探网关——TUN 下网关流量被 zju-connect 决策为 VPN 回环,健康隧道
+///   也会 Timeout,status 永远假黄(2026-07-28 真机事故)。
+/// - TUN 无 vpn_dns:直连网关 TCP 测延迟(豁免路由保证走物理口)。
+/// - Proxy + vpn_dns:SOCKS5 穿隧道探测(经 mixed_port,首字节 0x05 会被 relay 到
+///   socks 上游,顺带验证转发层)。
+/// - Proxy 无 vpn_dns:回退 curl 直连网关(旧行为,对隧道假死不敏感)。
+/// 单次 1.5s:交互命令要快——健康隧道的往返远小于此,判死则立即出黄胶囊,
 /// 不为重试多等;偶发误判下一次 status 自然纠正。daemon 侧看门狗仍是 3s×2(稳定优先)。
 pub fn probe_state_latency(st: &RuntimeState) -> Delay {
-    if let Some(ip) = st.vpn_dns.as_deref().and_then(|d| d.parse().ok()) {
+    let vpn_dns: Option<std::net::Ipv4Addr> = st.vpn_dns.as_deref().and_then(|d| d.parse().ok());
+    if st.mode == crate::config::Mode::Tun {
+        let probed = match vpn_dns {
+            Some(ip) => dns_udp_probe(ip, 53, &st.server, Duration::from_millis(1500)),
+            // state 未存 https_port,网关 HTTPS 口按 443(与配置默认一致)
+            None => direct_tcp_probe(&st.server, 443, Duration::from_millis(1500)),
+        };
+        return match probed {
+            Some(d) => Delay::Value((d.as_millis() as u64).max(1)),
+            None => Delay::Timeout,
+        };
+    }
+    if let Some(ip) = vpn_dns {
         let mixed = format!("127.0.0.1:{}", st.port);
         return match socks_probe(&mixed, ip, 53, Duration::from_millis(1500)) {
             Some(d) => Delay::Value((d.as_millis() as u64).max(1)),
@@ -175,6 +192,80 @@ pub fn socks_probe(
     match reply {
         [0x05, 0x00] | [0x05, 0x05] => Some(start.elapsed()),
         _ => None,
+    }
+}
+
+/// 直连 TCP 可达性探测(不经任何代理):解析 host 后 connect_timeout,通则返回耗时。
+/// TUN 模式的降级探针用它直连网关——绝不能经 zju-connect 代理(会被决策为 VPN 回环)。
+pub fn direct_tcp_probe(host: &str, port: u16, timeout: Duration) -> Option<Duration> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let start = Instant::now();
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    for addr in addrs {
+        let remain = timeout.checked_sub(start.elapsed())?;
+        if TcpStream::connect_timeout(&addr, remain).is_ok() {
+            return Some(start.elapsed());
+        }
+    }
+    None
+}
+
+/// 构造最小 DNS A 查询报文(RD=1):12 字节头 + QNAME labels + QTYPE=A + QCLASS=IN。
+fn build_dns_query(txid: u16, qname: &str) -> Vec<u8> {
+    let mut q = Vec::with_capacity(12 + qname.len() + 6);
+    q.extend_from_slice(&txid.to_be_bytes());
+    q.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
+    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // AN/NS/AR=0
+    for label in qname.split('.').filter(|l| !l.is_empty()) {
+        let bytes = label.as_bytes();
+        q.push(bytes.len().min(63) as u8);
+        q.extend_from_slice(&bytes[..bytes.len().min(63)]);
+    }
+    q.push(0); // 根标签
+    q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A, QCLASS=IN
+    q
+}
+
+/// 校验 DNS 应答是否与查询匹配:txid 一致 + QR=1(是应答)。不苛求 RCODE——
+/// NXDOMAIN/ServFail 同样证明查询真正穿隧道往返了,数据面是活的。
+fn dns_reply_matches(txid: u16, buf: &[u8]) -> bool {
+    buf.len() >= 12 && buf[..2] == txid.to_be_bytes() && buf[2] & 0x80 != 0
+}
+
+/// TUN 数据面探针:向 VPN DNS 直发 UDP A 查询(内核路由把包送进 utun →
+/// zju-connect TUN 栈 → 隧道 → VPN DNS),收到匹配应答即活,返回往返耗时。
+///
+/// 背景:VPN DNS(如 10.0.104.104)不应答 TCP 53,穿隧道 SOCKS CONNECT 探针在
+/// TUN 模式下永远降级;而降级的 curl 网关探测被 zju-connect 决策为 VPN 回环
+/// (tunnel.log 实证 `111.207.219.226:443 -> VPN`)必超时——健康隧道被看门狗误杀、
+/// 恢复验活必败(2026-07-28 真机事故)。UDP 与 zju-connect 自身 remote DNS 同路,
+/// 有真机实证可用。仅适用于 TUN 模式:Proxy 模式没有内网路由,UDP 包出物理口即丢。
+pub fn dns_udp_probe(
+    dns_ip: std::net::Ipv4Addr,
+    port: u16,
+    qname: &str,
+    timeout: Duration,
+) -> Option<Duration> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((dns_ip, port)).ok()?;
+    let txid = (std::process::id() as u16)
+        ^ (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u16)
+            .unwrap_or(0));
+    let start = Instant::now();
+    sock.send(&build_dns_query(txid, qname)).ok()?;
+    let deadline = start + timeout;
+    let mut buf = [0u8; 512];
+    loop {
+        let remain = deadline.checked_duration_since(Instant::now())?;
+        sock.set_read_timeout(Some(remain)).ok()?;
+        match sock.recv(&mut buf) {
+            Ok(n) if dns_reply_matches(txid, &buf[..n]) => return Some(start.elapsed()),
+            Ok(_) => continue, // 串包(txid 不匹配),在预算内继续等
+            Err(_) => return None,
+        }
     }
 }
 
@@ -289,5 +380,68 @@ mod tests {
     fn socks_probe_garbage_reply_is_dead() {
         let addr = fake_socks(vec![0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0]);
         assert!(socks_probe(&addr, TARGET, 53, SHORT).is_none());
+    }
+
+    #[test]
+    fn dns_query_wire_shape() {
+        let q = build_dns_query(0xabcd, "work.yangqianguan.com");
+        assert_eq!(&q[..2], &[0xab, 0xcd]); // txid
+        assert_eq!(q[2] & 0x80, 0); // QR=0(查询)
+        assert_eq!(q[2] & 0x01, 1); // RD=1
+        assert_eq!(&q[4..6], &[0x00, 0x01]); // QDCOUNT=1
+        // QNAME: 4"work" 12"yangqianguan" 3"com" 0
+        let mut expect = vec![4u8];
+        expect.extend(b"work");
+        expect.push(12);
+        expect.extend(b"yangqianguan");
+        expect.push(3);
+        expect.extend(b"com");
+        expect.push(0);
+        assert_eq!(&q[12..12 + expect.len()], &expect[..]);
+        // 尾部 QTYPE=A QCLASS=IN
+        assert_eq!(&q[q.len() - 4..], &[0x00, 0x01, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn dns_reply_matching_rules() {
+        let mut reply = build_dns_query(0x1234, "a.com");
+        reply[2] |= 0x80; // QR=1
+        assert!(dns_reply_matches(0x1234, &reply));
+        assert!(!dns_reply_matches(0x9999, &reply)); // txid 不匹配
+        let query = build_dns_query(0x1234, "a.com");
+        assert!(!dns_reply_matches(0x1234, &query)); // QR=0 是查询不是应答
+        assert!(!dns_reply_matches(0x1234, &reply[..8])); // 报文太短
+        // NXDOMAIN(RCODE=3)也算活:查询真正往返了
+        let mut nx = reply.clone();
+        nx[3] |= 0x03;
+        assert!(dns_reply_matches(0x1234, &nx));
+    }
+
+    /// 假 DNS server:收到查询,把 QR 置 1 原样回射(txid 天然匹配)。
+    fn fake_dns(reply: bool) -> (std::net::Ipv4Addr, u16) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            if let Ok((n, peer)) = sock.recv_from(&mut buf) {
+                if reply && n >= 12 {
+                    buf[2] |= 0x80;
+                    let _ = sock.send_to(&buf[..n], peer);
+                }
+            }
+        });
+        (std::net::Ipv4Addr::LOCALHOST, port)
+    }
+
+    #[test]
+    fn dns_udp_probe_reply_is_alive() {
+        let (ip, port) = fake_dns(true);
+        assert!(dns_udp_probe(ip, port, "work.yangqianguan.com", SHORT).is_some());
+    }
+
+    #[test]
+    fn dns_udp_probe_silence_times_out_dead() {
+        let (ip, port) = fake_dns(false);
+        assert!(dns_udp_probe(ip, port, "work.yangqianguan.com", SHORT).is_none());
     }
 }

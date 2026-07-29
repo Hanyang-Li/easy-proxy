@@ -111,6 +111,31 @@ fn tun_guardrails(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+/// 隧道就绪后钉网关豁免主机路由(helper route-exempt):到网关自身的流量必须走物理口。
+/// 服务端下发的 TUN 路由罩住全公网且不排除网关,zju-connect 每 60s 的 update_session
+/// 保活会被吸进隧道回环 → 服务端判 idle 断会话 → 隧道 ~2 分钟必死(2026-07-28 真机事故)。
+/// 必须在任何「到网关」的探测之前执行;失败只警告不致命(隧道死了由 TunnelDown 恢复兜底)。
+async fn tun_route_exempt(gateway_ip: Option<&str>) {
+    let Some(ip) = gateway_ip.filter(|s| crate::tun::valid_ipv4(s)) else {
+        eprintln!("[daemon] 未从日志解析到网关 IP,跳过网关豁免路由(隧道保活可能被回环拖死)");
+        return;
+    };
+    match Command::new("/usr/bin/sudo")
+        .args(["-n", crate::tun::HELPER_PATH, "route-exempt", ip])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            eprintln!("[daemon] 网关豁免路由已钉: {ip} → 物理网关");
+        }
+        Ok(out) => eprintln!(
+            "[daemon] route-exempt 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!("[daemon] route-exempt 无法执行: {e}"),
+    }
+}
+
 /// 隧道就绪后同步 scoped resolver(幂等):dns_suffixes 非空且拿到 vpn_dns 才写;
 /// 失败只警告不致命——resolver 缺失时内网域名仍可走 7899 代理路径。
 async fn tun_dns_sync(cfg: &AppConfig, state: &RuntimeState) {
@@ -192,7 +217,23 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
     match wait_socks_ready(paths, &mut child, Duration::from_secs(30)).await {
         Ok(info) => {
             state.tunnel_ip = info.ip;
+            // TUN:护栏 + 网关豁免路由必须先于任何探测——降级探测直连网关,
+            // 豁免没钉时会被新隧道路由吸进回环、必假死
+            if args.tun {
+                if let Err(e) = tun_guardrails(paths) {
+                    kill_tunnel(&mut child, true).await;
+                    state.error = Some(e.to_string());
+                    let _ = paths.write_state(&state);
+                    return Err(e);
+                }
+                tun_route_exempt(info.gateway_ip.as_deref()).await;
+            }
             state.vpn_dns = pick_probe_target(&args, info.vpn_dns).await;
+            // scoped resolver 在探针选型后写:UDP DNS 探针不通说明经隧道 DNS 真不可用,
+            // 此时写 resolver 只会造出毒解析
+            if args.tun {
+                tun_dns_sync(&cfg, &state).await;
+            }
         }
         Err(e) => {
             kill_tunnel(&mut child, args.tun).await;
@@ -200,17 +241,6 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
             let _ = paths.write_state(&state);
             return Err(e);
         }
-    }
-
-    // TUN 启动护栏 + scoped resolver:就绪后立即执行,护栏失败绝不假 online
-    if args.tun {
-        if let Err(e) = tun_guardrails(paths) {
-            kill_tunnel(&mut child, true).await;
-            state.error = Some(e.to_string());
-            let _ = paths.write_state(&state);
-            return Err(e);
-        }
-        tun_dns_sync(&cfg, &state).await;
     }
 
     let listener = match TcpListener::bind(("127.0.0.1", args.mixed_port)).await {
@@ -407,15 +437,35 @@ async fn restart_zju(child: &mut Child, paths: &Paths, args: &ServeArgs, twfid: 
 
 /// 探测连通性(true=通)。同步实现,丢 spawn_blocking。
 ///
-/// 两种模式:
-/// - `vpn_dns=Some`:SOCKS5 CONNECT 到 VPN DNS:53,**穿隧道**测数据面(网关地址被
+/// 按模式分流(2026-07-28 真机事故教训:TUN 下凡是「到网关」的流量都会被吸进隧道
+/// 回环——curl 经 1081 到网关被 zju-connect 决策为 VPN,必超时,健康隧道被误杀):
+/// - TUN + `vpn_dns=Some`:UDP DNS 查询直发 VPN DNS(内核路由送进 utun,测完整数据面)。
+/// - TUN + `vpn_dns=None`:直连网关 TCP(不经代理;豁免路由保证走物理口,对隧道假死不敏感)。
+/// - Proxy + `vpn_dns=Some`:SOCKS5 CONNECT 到 VPN DNS:53,**穿隧道**测数据面(网关地址被
 ///   zju-connect 路由为 DIRECT,curl 网关只能测直连,切网后隧道假死时照样绿——0.3.0 的坑)。
-/// - `vpn_dns=None`:回退 curl 直连网关(退化行为,对隧道假死不敏感)。
+/// - Proxy + `vpn_dns=None`:回退 curl 直连网关(退化行为,对隧道假死不敏感)。
 ///
-/// 关键:两种模式都**直连 zju-connect 上游(1080/1081),绝不走 mixed_port**——
-/// mixed_port 的转发靠本 daemon 主循环 accept,而探测/恢复期间主循环正阻塞在这里、不 accept,
-/// 若探 mixed_port 必然自锁超时、假报断线。直连上游由 zju-connect 独立进程处理,不受影响。
+/// 关键:绝不走 mixed_port——mixed_port 的转发靠本 daemon 主循环 accept,而探测/恢复期间
+/// 主循环正阻塞在这里、不 accept,若探 mixed_port 必然自锁超时、假报断线。
 async fn probe(args: &ServeArgs, vpn_dns: Option<&str>) -> bool {
+    if args.tun {
+        if let Some(ip) = vpn_dns.and_then(|d| d.parse::<std::net::Ipv4Addr>().ok()) {
+            let server = args.server.clone();
+            return tokio::task::spawn_blocking(move || {
+                (0..2).any(|_| {
+                    crate::tunnel::dns_udp_probe(ip, 53, &server, Duration::from_secs(3)).is_some()
+                })
+            })
+            .await
+            .unwrap_or(false);
+        }
+        let (server, port) = (args.server.clone(), args.https_port);
+        return tokio::task::spawn_blocking(move || {
+            (0..2).any(|_| crate::tunnel::direct_tcp_probe(&server, port, Duration::from_secs(3)).is_some())
+        })
+        .await
+        .unwrap_or(false);
+    }
     if let Some(ip) = vpn_dns.and_then(|d| d.parse::<std::net::Ipv4Addr>().ok()) {
         let socks = args.socks.clone();
         return tokio::task::spawn_blocking(move || {
@@ -440,13 +490,14 @@ async fn probe(args: &ServeArgs, vpn_dns: Option<&str>) -> bool {
 /// 大概率是目标不可用(如 DNS 不答 TCP 53)而非隧道问题——若不降级,探针会永远假死,
 /// 看门狗反复重启最后把 daemon 拖下线。降级后行为等同 0.3.0(活着但对隧道假死不敏感)。
 async fn pick_probe_target(args: &ServeArgs, parsed_dns: Option<String>) -> Option<String> {
+    let kind = if args.tun { "UDP DNS" } else { "SOCKS TCP" };
     match parsed_dns {
         Some(dns) => {
             if probe(args, Some(&dns)).await {
-                eprintln!("[daemon] 健康检查:穿隧道探测 VPN DNS {dns}:53");
+                eprintln!("[daemon] 健康检查:穿隧道 {kind} 探测 VPN DNS {dns}:53");
                 Some(dns)
             } else {
-                eprintln!("[daemon] 穿隧道探针(VPN DNS {dns}:53)在新隧道上不通,降级为网关直连探测");
+                eprintln!("[daemon] 穿隧道 {kind} 探针(VPN DNS {dns}:53)在新隧道上不通,降级为网关直连探测");
                 None
             }
         }
@@ -511,20 +562,25 @@ async fn attempt_recover(
     if !shutdown.load(Ordering::Relaxed) {
         match restart_zju(child, paths, args, current_twfid).await {
             Ok(info) => {
-                // 新隧道上重选探针目标(必要时降级),再按选定目标验活
                 state.tunnel_ip = info.ip;
+                // TUN:护栏 + 网关豁免路由先于任何探测(降级探测直连网关,豁免没钉必假死)
+                if args.tun {
+                    if let Err(e) = tun_guardrails(paths) {
+                        eprintln!("[daemon] 恢复后护栏失败: {e}");
+                        return RecoverOutcome::GiveUp;
+                    }
+                    tun_route_exempt(info.gateway_ip.as_deref()).await;
+                }
+                // 新隧道上重选探针目标(必要时降级),再按选定目标验活
                 state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
                 if probe(args, state.vpn_dns.as_deref()).await {
                     if args.tun {
-                        if let Err(e) = tun_guardrails(paths) {
-                            eprintln!("[daemon] 恢复后护栏失败: {e}");
-                            return RecoverOutcome::GiveUp;
-                        }
                         tun_dns_sync(cfg, state).await;
                     }
                     eprintln!("[daemon] 旧 TWFID 重启成功");
                     return RecoverOutcome::Online;
                 }
+                eprintln!("[daemon] 旧 TWFID 重启后验活探测不通");
             }
             Err(e) => eprintln!("[daemon] 旧 TWFID 重启失败: {e}"),
         }
@@ -578,18 +634,22 @@ async fn attempt_recover(
     match restart_zju(child, paths, args, &new_twfid).await {
         Ok(info) => {
             state.tunnel_ip = info.ip;
+            if args.tun {
+                if let Err(e) = tun_guardrails(paths) {
+                    eprintln!("[daemon] 恢复后护栏失败: {e}");
+                    return RecoverOutcome::GiveUp;
+                }
+                tun_route_exempt(info.gateway_ip.as_deref()).await;
+            }
             state.vpn_dns = pick_probe_target(args, info.vpn_dns).await;
             if probe(args, state.vpn_dns.as_deref()).await {
                 if args.tun {
-                    if let Err(e) = tun_guardrails(paths) {
-                        eprintln!("[daemon] 恢复后护栏失败: {e}");
-                        return RecoverOutcome::GiveUp;
-                    }
                     tun_dns_sync(cfg, state).await;
                 }
                 eprintln!("[daemon] 静默重登并重启成功");
                 RecoverOutcome::Online
             } else {
+                eprintln!("[daemon] 新 TWFID 重启后验活探测不通");
                 RecoverOutcome::GiveUp
             }
         }
@@ -694,10 +754,12 @@ async fn wait_gateway_reachable(args: &ServeArgs, budget: Duration, shutdown: &A
     }
 }
 
-/// zju-connect 就绪信息：隧道虚拟 IP + 服务端下发的 VPN DNS（穿隧道探针的目标）。
+/// zju-connect 就绪信息：隧道虚拟 IP + 服务端下发的 VPN DNS（穿隧道探针的目标)
+/// + 实际连接的网关公网 IP(TUN 网关豁免路由的目标)。
 struct ReadyInfo {
     ip: String,
     vpn_dns: Option<String>,
+    gateway_ip: Option<String>,
 }
 
 /// 从 tunnel.log 解析服务端下发/显式配置的 VPN DNS 地址。
@@ -707,6 +769,15 @@ fn parse_vpn_dns(text: &str) -> Option<String> {
     use_re
         .captures(text)
         .or_else(|| set_re.captures(text))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// 从 tunnel.log 解析 zju-connect 实际连接的网关公网 IP(`Socket: connected to: IP:port`)。
+fn parse_gateway_ip(text: &str) -> Option<String> {
+    Regex::new(r"Socket: connected to:\s*([\d.]+):")
+        .unwrap()
+        .captures(text)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
 }
@@ -733,7 +804,11 @@ async fn wait_socks_ready(paths: &Paths, child: &mut Child, timeout: Duration) -
                 .and_then(|c| c.get(1))
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
-            return Ok(ReadyInfo { ip, vpn_dns: parse_vpn_dns(&text) });
+            return Ok(ReadyInfo {
+                ip,
+                vpn_dns: parse_vpn_dns(&text),
+                gateway_ip: parse_gateway_ip(&text),
+            });
         }
         if Instant::now() >= deadline {
             return Err(anyhow!("等待 zju-connect SOCKS 就绪超时\n{}", tail(paths)));
@@ -790,6 +865,16 @@ mod tests {
     #[test]
     fn parse_vpn_dns_absent_is_none() {
         assert_eq!(parse_vpn_dns("SOCKS5 server listening on 127.0.0.1:1080"), None);
+    }
+
+    #[test]
+    fn parse_gateway_ip_from_real_log() {
+        // 取自真机 tunnel.log(2026-07-28):TLS 建链行携带网关公网 IP
+        let log = "2026/07/28 23:30:14 Socket: connected to: 111.207.219.226:443\n\
+                   2026/07/28 23:30:14 TLS: connected to: 111.207.219.226:443\n\
+                   2026/07/28 23:30:14 Client IP: 2.0.1.54\n";
+        assert_eq!(parse_gateway_ip(log), Some("111.207.219.226".to_string()));
+        assert_eq!(parse_gateway_ip("no socket line here"), None);
     }
 
     #[test]

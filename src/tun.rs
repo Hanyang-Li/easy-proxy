@@ -22,6 +22,7 @@ set -eu
 DIR="/usr/local/libexec/easy-proxy"
 ZJU="$DIR/zju-connect"
 PIDFILE="/var/run/easy-proxy-tun.pid"
+EXEMPT_FILE="/var/run/easy-proxy-route-exempt"
 RESOLVER_DIR="/etc/resolver"
 MARKER="# managed by easy-proxy"
 
@@ -29,6 +30,16 @@ die() { echo "ep-tun-helper: $*" >&2; exit 1; }
 match() { printf '%s' "$1" | grep -Eq "$2"; }
 
 [ "$(id -u)" = "0" ] || die "需要 root(应经 sudo 调用)"
+
+# 摘网关豁免主机路由(按记录文件),隧道停/清残留时调用
+route_unexempt() {
+  [ -f "$EXEMPT_FILE" ] || return 0
+  ip=$(cat "$EXEMPT_FILE" 2>/dev/null || true)
+  if match "${ip:-}" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    /sbin/route -n delete -host "$ip" >/dev/null 2>&1 || true
+  fi
+  rm -f "$EXEMPT_FILE"
+}
 
 # 按 pidfile 停隧道:校验 pid 的可执行路径确为 root copy,防 pid 复用误杀
 stop_tunnel() {
@@ -86,6 +97,21 @@ case "$cmd" in
     ;;
   stop-tunnel)
     stop_tunnel
+    route_unexempt
+    ;;
+  route-exempt)
+    # 网关豁免:到 VPN 网关自身的流量必须走物理口。服务端下发的 TUN 路由罩住全公网
+    # 且不排除网关,zju-connect 每 60s 的 update_session 保活会被吸进隧道回环,
+    # 服务端判 idle 断会话 → 隧道 ~2 分钟必死(2026-07-28 真机事故)。
+    # 主机路由比任何网段更精确,必然优先。
+    ip="${1:-}"
+    match "$ip" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || die "ip 非法"
+    gw=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+    match "${gw:-}" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || die "无法取得物理默认网关(gateway=${gw:-空})"
+    route_unexempt
+    /sbin/route -n delete -host "$ip" >/dev/null 2>&1 || true
+    /sbin/route -n add -host "$ip" "$gw" >/dev/null 2>&1 || die "添加豁免路由失败: $ip -> $gw"
+    echo "$ip" > "$EXEMPT_FILE"
     ;;
   dns-sync)
     [ $# -gt 0 ] || die "dns-sync 需要至少一个 suffix=ip"
@@ -112,6 +138,7 @@ case "$cmd" in
     ;;
   janitor)
     dns_clean
+    route_unexempt
     # 只杀可执行路径 == root copy 的孤儿隧道,绝不误伤用户态 zju-connect
     pids=$(ps -axo pid=,comm= | awk -v z="$ZJU" '$2==z {print $1}' || true)
     for p in $pids; do kill "$p" 2>/dev/null || true; done
@@ -482,6 +509,11 @@ resolver #1\n\
         assert!(HELPER_SCRIPT.contains("-add-route"));
         assert!(HELPER_SCRIPT.contains("# managed by easy-proxy"));
         assert!(HELPER_SCRIPT.contains("/var/run/easy-proxy-tun.pid"));
+        // 网关豁免:route-exempt 子命令存在;stop-tunnel 与 janitor 都必须清豁免路由,
+        // 否则断开后残留主机路由指向旧物理网关,切网后网关域名解析仍会走错口
+        assert!(HELPER_SCRIPT.contains("route-exempt)"));
+        assert!(HELPER_SCRIPT.contains("/var/run/easy-proxy-route-exempt"));
+        assert!(HELPER_SCRIPT.matches("    route_unexempt").count() >= 3, "stop-tunnel/janitor/route-exempt 三处都应清旧豁免");
         // root copy 路径由 DIR + 文件名拼成,两个组成部分都必须与常量一致
         assert!(HELPER_SCRIPT.contains(&format!("DIR=\"{HELPER_DIR}\"")));
         assert!(HELPER_SCRIPT.contains("ZJU=\"$DIR/zju-connect\""));
