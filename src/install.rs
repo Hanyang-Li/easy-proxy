@@ -292,6 +292,7 @@ mixed_port: 7899
 # 分流解析（nameserver 指服务端下发的 VPN DNS）；只放内网 zone，别把纯公网域名圈进来。
 # tun:
 #   dns_suffixes: ["corp.example.com"]
+#   exempt_ips: ["203.0.113.10"]   # 这些 IP 不走 VPN(钉物理网关主机路由),如自建跳板机
 prompt:
   online_icon: "󰌘"
   offline_icon: "󰌙"

@@ -77,9 +77,35 @@ fn resolve_gateway_ips(server: &str, port: u16) -> Vec<String> {
     ips
 }
 
+/// config.yaml tun.exempt_ips 过滤:只留合法 IPv4,非法项告警跳过(helper 内正则还会终检)。
+fn valid_extra_exempt(ips: &[String]) -> Vec<String> {
+    ips.iter()
+        .map(|s| s.trim())
+        .filter(|s| {
+            let ok = crate::tun::valid_ipv4(s);
+            if !ok {
+                eprintln!("[daemon] tun.exempt_ips 含非法项,跳过: {s}");
+            }
+            ok
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// 网关 IP 与配置豁免 IP 合并去重(保持网关在前)。
+fn merge_exempt_ips(gateway: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    let mut ips = gateway;
+    for ip in extra {
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    ips
+}
+
 /// 构造隧道启动命令:Proxy 直接跑用户态 zju-connect;TUN 经 sudo -n helper(root)。
 /// TUN 分支先做 Rust 侧预校验,坏参数在 spawn 前就报错(helper 内还有最终校验)。
-fn tunnel_command(paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<Command> {
+fn tunnel_command(paths: &Paths, args: &ServeArgs, twfid: &str, extra_exempt: &[String]) -> Result<Command> {
     if args.tun {
         crate::tun::validate_serve(&args.server, twfid, &args.socks, &args.http)?;
         let mut cmd = Command::new("/usr/bin/sudo");
@@ -91,11 +117,18 @@ fn tunnel_command(paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<Comman
             .arg("--twfid").arg(twfid)
             .arg("--socks").arg(&args.socks)
             .arg("--http").arg(&args.http);
-        let ips = resolve_gateway_ips(&args.server, args.https_port);
-        if ips.is_empty() {
-            eprintln!("[daemon] 启动前解析网关 IP 失败,跳过预豁免(隧道可能踩启动竞态)");
+        let gw_ips = resolve_gateway_ips(&args.server, args.https_port);
+        if gw_ips.is_empty() {
+            eprintln!("[daemon] 启动前解析网关 IP 失败,跳过网关预豁免(隧道可能踩启动竞态)");
         } else {
-            eprintln!("[daemon] 启动前预豁免网关 IP: {}", ips.join(","));
+            eprintln!("[daemon] 启动前预豁免网关 IP: {}", gw_ips.join(","));
+        }
+        let extra = valid_extra_exempt(extra_exempt);
+        if !extra.is_empty() {
+            eprintln!("[daemon] 启动前预豁免配置 IP: {}", extra.join(","));
+        }
+        let ips = merge_exempt_ips(gw_ips, extra);
+        if !ips.is_empty() {
             cmd.arg("--exempt-ips").arg(ips.join(","));
         }
         Ok(cmd)
@@ -278,7 +311,7 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
 
     let log = std::fs::File::create(&paths.tunnel_log)
         .with_context(|| format!("无法创建 {}", paths.tunnel_log.display()))?;
-    let mut child = tunnel_command(paths, &args, &args.twfid)?
+    let mut child = tunnel_command(paths, &args, &args.twfid, &cfg.tun.exempt_ips)?
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -496,11 +529,17 @@ async fn run(args: ServeArgs, cfg: AppConfig, paths: &Paths) -> Result<()> {
 
 /// 用给定 twfid 重启 zju-connect:回收旧进程 → truncate 日志 → 起新进程 → 等 SOCKS 就绪。
 /// TUN 模式下停/起都经 helper(root),日志经 fd 继承照写 tunnel.log。
-async fn restart_zju(child: &mut Child, paths: &Paths, args: &ServeArgs, twfid: &str) -> Result<ReadyInfo> {
+async fn restart_zju(
+    child: &mut Child,
+    paths: &Paths,
+    args: &ServeArgs,
+    twfid: &str,
+    extra_exempt: &[String],
+) -> Result<ReadyInfo> {
     kill_tunnel(child, args.tun).await; // 回收旧进程,杜绝僵尸
     let log = std::fs::File::create(&paths.tunnel_log)
         .with_context(|| format!("无法创建 {}", paths.tunnel_log.display()))?;
-    let new_child = tunnel_command(paths, args, twfid)?
+    let new_child = tunnel_command(paths, args, twfid, extra_exempt)?
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -635,7 +674,7 @@ async fn attempt_recover(
 
     // step1: 旧 TWFID 重启(不吃闸门)
     if !shutdown.load(Ordering::Relaxed) {
-        match restart_zju(child, paths, args, current_twfid).await {
+        match restart_zju(child, paths, args, current_twfid, &cfg.tun.exempt_ips).await {
             Ok(info) => {
                 state.tunnel_ip = info.ip;
                 // TUN:护栏 + 网关豁免路由先于任何探测(降级探测直连网关,豁免没钉必假死)
@@ -707,7 +746,7 @@ async fn attempt_recover(
         }
     };
     *current_twfid = new_twfid.clone();
-    match restart_zju(child, paths, args, &new_twfid).await {
+    match restart_zju(child, paths, args, &new_twfid, &cfg.tun.exempt_ips).await {
         Ok(info) => {
             state.tunnel_ip = info.ip;
             if args.tun {
@@ -902,6 +941,18 @@ fn tail(paths: &Paths) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn extra_exempt_filters_and_merges() {
+        let extra = valid_extra_exempt(&[" 39.106.114.191 ".into(), "bad".into(), "1.2.3.4/32".into()]);
+        assert_eq!(extra, vec!["39.106.114.191".to_string()]);
+        let merged = merge_exempt_ips(
+            vec!["111.207.219.226".into()],
+            vec!["39.106.114.191".into(), "111.207.219.226".into()],
+        );
+        assert_eq!(merged, vec!["111.207.219.226".to_string(), "39.106.114.191".to_string()]);
+        assert_eq!(merge_exempt_ips(vec![], extra.clone()), extra);
+    }
 
     #[test]
     fn route_event_lines_detected() {

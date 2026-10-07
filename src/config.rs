@@ -52,6 +52,10 @@ pub struct TunConfig {
     /// nameserver 指服务端下发的 VPN DNS。默认空 = 不写任何 resolver 文件。
     #[serde(default)]
     pub dns_suffixes: Vec<String>,
+    /// 额外豁免 IP:每次起隧道前与网关 IP 一起钉成走物理网关的主机路由,
+    /// 让这些目标(如自建跳板 ECS)不进 VPN。默认空。
+    #[serde(default)]
+    pub exempt_ips: Vec<String>,
 }
 
 /// 连接模式:Proxy=现有纯代理;Tun=分流透明模式(root 隧道 + scoped resolver)。
@@ -335,6 +339,10 @@ mod tests {
         let c: AppConfig =
             serde_yaml::from_str("server: s\nusername: u\ntun:\n  dns_suffixes: [\"a.b\"]\n").unwrap();
         assert_eq!(c.tun.dns_suffixes, vec!["a.b".to_string()]);
+        assert!(c.tun.exempt_ips.is_empty());
+        let c: AppConfig =
+            serde_yaml::from_str("server: s\nusername: u\ntun:\n  exempt_ips: [\"1.2.3.4\"]\n").unwrap();
+        assert_eq!(c.tun.exempt_ips, vec!["1.2.3.4".to_string()]);
     }
 
     #[test]
